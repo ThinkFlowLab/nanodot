@@ -86,6 +86,9 @@ def build_parser() -> argparse.ArgumentParser:
     m_rm = memory_sub.add_parser("rm", help="delete an item")
     m_rm.add_argument("item_id")
 
+    # -- approvals -----------------------------------------------------------
+    subparsers.add_parser("approvals", help="pending requests and grants")
+
     # -- activity / inbox --------------------------------------------------
     activity = subparsers.add_parser("activity", help="what actually ran")
     activity.add_argument("task_id", nargs="?")
@@ -344,6 +347,27 @@ def _print_memory_item(item) -> None:
     )
 
 
+def _run_approvals(_: argparse.Namespace) -> int:
+    from nanodot.core.permissions import PermissionCenter
+
+    center = PermissionCenter()
+    print(f"mode: {center.mode().value} (read-only MVP: no external writes exist)")
+    pending = center.pending()
+    print(f"pending approvals: {len(pending)}")
+    for req in pending:
+        print(
+            f"  {req.id}  {req.action} on {req.target} ({req.scope}) "
+            f"task={req.task_id}"
+        )
+    grants = center.grants(active_only=True)
+    print(f"active grants: {len(grants)}")
+    for grant in grants:
+        print(
+            f"  {grant.id}  {grant.action} on {grant.target} ({grant.scope})"
+        )
+    return 0
+
+
 # -- activity / inbox -----------------------------------------------------------
 
 
@@ -473,6 +497,8 @@ def main(argv: list[str] | None = None) -> int:
         return _run_watch(args)
     if args.command == "memory":
         return _run_memory(args)
+    if args.command == "approvals":
+        return _run_approvals(args)
     if args.command == "activity":
         return _run_activity(args)
     if args.command == "inbox":
