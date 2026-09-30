@@ -92,7 +92,8 @@ class NativeNotifier:
     def notify(self, event: WatchEvent) -> None:
         if not event.notable:  # intermediate polls never notify (belt)
             return
-        message = self._redactor.scrub(event.message)
+        # The model summary decorates; the raw message is the truth.
+        message = self._redactor.scrub(event.summary or event.message)
         key = event_key(event)
         with self._lock:
             inserted = self._conn.execute(

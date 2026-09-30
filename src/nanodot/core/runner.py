@@ -8,6 +8,7 @@ scheduler/executor port (see adapter-seam.md) drives `run_once`.
 from __future__ import annotations
 
 import threading
+from dataclasses import replace
 from enum import Enum
 
 from nanodot.core import statemachine
@@ -21,10 +22,36 @@ from nanodot.ports.github import (
     RetryableError,
     SnapshotFetcher,
 )
+from nanodot.ports.inference import InferenceProvider, ProviderError, StateChange
 from nanodot.ports.notifier import NotificationSink
 
 MAX_BACKOFF_SECONDS = 3600
 PROLONGED_FAILURE_SECONDS = 3600
+
+
+def state_change_from_event(event: WatchEvent) -> StateChange:
+    """The whitelisted evidence for a summary, from an event."""
+    checks = tuple(
+        (check.get("name", ""), check.get("conclusion"))
+        for check in event.evidence.get("checks", [])
+    )
+    return StateChange(
+        kind=event.kind,
+        summary=event.message,
+        head_sha=event.evidence.get("head_sha", ""),
+        pr_state=event.evidence.get("pr_state", ""),
+        url=event.evidence.get("url", ""),
+        checks=checks,
+    )
+
+
+def safe_summarize(provider: InferenceProvider, event: WatchEvent) -> str | None:
+    """Summarize through the provider; degrade to None on any failure.
+    The summary decorates the notification — the raw message is the truth."""
+    try:
+        return provider.summarize(state_change_from_event(event))
+    except ProviderError:
+        return None
 
 
 class RunOutcome(str, Enum):
@@ -48,11 +75,13 @@ class TaskLoop:
         fetcher: SnapshotFetcher,
         sink: NotificationSink,
         activity: ActivityLog,
+        provider: InferenceProvider | None = None,
     ) -> None:
         self._store = store
         self._fetcher = fetcher
         self._sink = sink
         self._activity = activity
+        self._provider = provider
         self._locks: dict[str, threading.Lock] = {}
         self._locks_guard = threading.Lock()
 
@@ -107,6 +136,10 @@ class TaskLoop:
                 at=event.at,
             )
             if event.notable:
+                if self._provider is not None:
+                    summary = safe_summarize(self._provider, event)
+                    if summary:
+                        event = replace(event, summary=summary)
                 self._sink.notify(event)
 
         terminal = any(event.terminal for event in events)

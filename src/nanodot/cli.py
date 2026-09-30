@@ -49,8 +49,10 @@ def build_parser() -> argparse.ArgumentParser:
     watch = subparsers.add_parser("watch", help="task inbox: PR watches")
     watch_sub = watch.add_subparsers(dest="watch_command", required=True)
     add = watch_sub.add_parser("add", help="create a watch on one PR")
-    add.add_argument("target", help="owner/repo#number")
+    add.add_argument("target", nargs="?", help="owner/repo#number")
     add.add_argument("--purpose", default="tell me when required checks pass")
+    add.add_argument("--intent", help="describe the watch in one sentence; a "
+                     "configured model parses it into target + purpose")
     add.add_argument("--cadence", type=int, default=DEFAULT_CADENCE,
                      help="seconds between checks (default 300)")
     add.add_argument("--notify", default="check failures and terminal outcomes")
@@ -159,14 +161,37 @@ def _run_watch(args: argparse.Namespace) -> int:
                 file=sys.stderr,
             )
             return 1
+
+        target_text = args.target or ""
+        purpose = args.purpose
+        if args.intent:
+            from nanodot.native.inference_api import configured_provider
+            from nanodot.ports.inference import ProviderError
+
+            provider = configured_provider()
+            if provider is None:
+                print("note: no model configured (api-key, model-base-url, "
+                      "model-name); ignoring --intent", file=sys.stderr)
+            else:
+                try:
+                    draft = provider.parse_intent(args.intent)
+                    target_text = target_text or draft.target
+                    purpose = draft.purpose or purpose
+                except ProviderError as error:
+                    print(f"note: intent parsing failed ({error}); "
+                          "continuing with explicit arguments", file=sys.stderr)
+        if not target_text:
+            print("error: a target is required: owner/repo#number",
+                  file=sys.stderr)
+            return 1
         try:
-            target = PRTarget.parse(args.target)
+            target = PRTarget.parse(target_text)
         except TaskError as error:
             print(f"error: {error}", file=sys.stderr)
             return 1
         task = Task(
             target=target,
-            purpose=args.purpose,
+            purpose=purpose,
             cadence_seconds=args.cadence,
             notification_conditions=args.notify,
             stop_conditions=args.stop,

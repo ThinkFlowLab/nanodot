@@ -40,6 +40,7 @@ class WatchEvent:
     notable: bool = True
     task_id: str = ""
     at: float = 0.0
+    summary: str | None = None  # optional model summary; never the identity
 
 
 def _fingerprint(snapshot: Snapshot) -> str:
