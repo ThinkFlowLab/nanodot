@@ -24,7 +24,7 @@ class Redactor:
         values = [
             self._secrets.get(name) for name in self._secrets.names()
         ]
-        return [v for v in values if v]
+        return sorted((v for v in values if v), key=len, reverse=True)
 
     def scrub(self, text: str) -> str:
         for value in self._values():
@@ -33,19 +33,31 @@ class Redactor:
         return text
 
     def scrub_dict(self, mapping: dict[str, object]) -> dict[str, object]:
-        out: dict[str, object] = {}
-        for key, value in mapping.items():
+        """Scrub nested evidence/provenance as well as top-level text.
+
+        Check names and other external strings can occur in lists of
+        dictionaries. Returning a fresh value avoids mutating caller data.
+        """
+        def scrub_value(value: object) -> object:
             if isinstance(value, str):
-                out[key] = self.scrub(value)
-            else:
-                out[key] = value
-        return out
+                return self.scrub(value)
+            if isinstance(value, dict):
+                return self.scrub_dict(value)
+            if isinstance(value, list):
+                return [scrub_value(item) for item in value]
+            if isinstance(value, tuple):
+                return tuple(scrub_value(item) for item in value)
+            return value
+
+        return {self.scrub(key): scrub_value(value) for key, value in mapping.items()}
 
     def contains_secret(self, text: str) -> bool:
         return any(value and value in text for value in self._values())
 
 
-_SECRET_NAME_RE = re.compile(r"-token$|-key$|^token$|^secret$", re.IGNORECASE)
+_SECRET_NAME_RE = re.compile(
+    r"(?:^|[-_])(?:token|key|secret|password|passwd|pat)$", re.IGNORECASE
+)
 
 
 def is_secret_name(name: str) -> bool:

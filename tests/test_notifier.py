@@ -116,3 +116,77 @@ def test_os_notification_failure_is_tolerated(home: Path) -> None:
     )
     sink.notify(make_event())
     assert len(sink.list()) == 1  # inbox still written
+
+
+@pytest.mark.parametrize("text", [
+    'quote" & do shell script "touch /tmp/never" --',
+    "backslash\\ and new\nline\rcontrol\ttab",
+    "日本語 🚀 -- -e malicious",
+])
+def test_untrusted_notification_is_only_script_argument(home, text):
+    from nanodot.native.notifier import NOTIFICATION_SCRIPT
+
+    recorder = RecordingOsascript()
+    sink = NativeNotifier(path=home / "nanodot.db", osascript_runner=recorder)
+    sink.notify(make_event(message=text))
+    command = recorder.calls[0]
+    assert command[:3] == ["osascript", "-e", NOTIFICATION_SCRIPT]
+    assert text not in NOTIFICATION_SCRIPT
+    assert command[3:] == [f"{CHECKS_FAILED}: {text}", "nanodot"]
+    assert sink.list()[0].message == text
+
+
+def test_occurrence_distinguishes_recurrence_but_replays_once(notifier):
+    first = make_event(occurrence="1")
+    again = make_event(occurrence="3")
+    notifier.notify(first)
+    notifier.notify(again)
+    notifier.notify(again)
+    assert len(notifier.list()) == 2
+    assert len(notifier.recorder.calls) == 2
+
+
+def test_same_sha_failure_recurrence_delivered_once_per_occurrence_after_restart(home):
+    """Persisted transition identity survives recovery, recurrence, and replay."""
+    from fakes import FAILURE, QUEUED
+    from nanodot.core.activity import ActivityLog
+    from nanodot.core.runner import TaskLoop
+    from nanodot.core.tasks import Task, TaskStore
+
+    path = home / "nanodot.db"
+    store = TaskStore(path=path)
+    activity = ActivityLog(path=path)
+    sink = NativeNotifier(path=path, os_notify=False)
+    github = FakeGitHub(TARGET)
+    github.add_check("ci", FAILURE, sha=github.head_sha)
+    task = store.create(Task(target=TARGET, purpose="watch", next_check_at=0))
+    loop = TaskLoop(store, github, sink, activity)
+    loop.run_once(store.get(task.id), now=1000)
+    first = sink.list()[0]
+    github.checks[github.head_sha] = []
+    github.add_check("ci", None, sha=github.head_sha, status=QUEUED)
+    loop.run_once(store.get(task.id), now=1100)
+    assert len(sink.list()) == 1
+    store.close()
+    activity.close()
+    sink.close()
+
+    store = TaskStore(path=path)
+    activity = ActivityLog(path=path)
+    sink = NativeNotifier(path=path, os_notify=False)
+    loop = TaskLoop(store, github, sink, activity)
+    github.checks[github.head_sha] = []
+    github.add_check("ci", FAILURE, sha=github.head_sha)
+    loop.run_once(store.get(task.id), now=1200)
+    entries = sink.list()
+    assert [entry.kind for entry in entries] == [CHECKS_FAILED, CHECKS_FAILED]
+    assert entries[0].id != first.id
+    assert entries[0].message == first.message
+    assert entries[0].evidence == first.evidence
+    assert len(sink.os_notifications) == 1
+    loop.run_once(store.get(task.id), now=1300)
+    assert len(sink.list()) == 2
+    assert len(sink.os_notifications) == 1
+    store.close()
+    activity.close()
+    sink.close()

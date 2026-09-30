@@ -23,6 +23,13 @@ from nanodot.core.statemachine import WatchEvent
 from nanodot.paths import database_path
 
 DEFAULT_TITLE = "nanodot"
+# argv is data, never executable AppleScript. External check names and
+# model-generated summaries must not be interpolated into source code.
+NOTIFICATION_SCRIPT = (
+    "on run argv\n"
+    "display notification (item 1 of argv) with title (item 2 of argv)\n"
+    "end run"
+)
 
 
 def _default_osascript(*args: object, **kwargs: object) -> None:
@@ -34,6 +41,7 @@ def event_key(event: WatchEvent) -> str:
     payload = json.dumps(
         {
             "task_id": event.task_id,
+            "occurrence": event.occurrence,
             "kind": event.kind,
             "message": event.message,
             "evidence": event.evidence,
@@ -121,7 +129,9 @@ class NativeNotifier:
                 [
                     "osascript",
                     "-e",
-                    f'display notification "{text}" with title "{DEFAULT_TITLE}"',
+                    NOTIFICATION_SCRIPT,
+                    text,
+                    DEFAULT_TITLE,
                 ],
                 capture_output=True,
                 timeout=10,

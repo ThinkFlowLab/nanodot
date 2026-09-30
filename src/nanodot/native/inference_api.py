@@ -16,6 +16,7 @@ from nanodot.core.config import Config
 from nanodot.core.egress import EgressGuard
 from nanodot.core.redaction import Redactor
 from nanodot.native.secrets_file import FileSecretStore
+from nanodot.native.http import authenticated_urlopen
 from nanodot.ports.inference import (
     InferenceProvider,
     ProviderError,
@@ -25,6 +26,7 @@ from nanodot.ports.inference import (
 
 DEFAULT_BASE_URL = "https://api.openai.com/v1"
 API_KEY_SECRET = "api-key"
+DEFAULT_REQUEST_TIMEOUT = 5.0
 
 
 def configured_provider() -> "APIInferenceProvider | None":
@@ -37,7 +39,8 @@ def configured_provider() -> "APIInferenceProvider | None":
     if not (key and base_url and model):
         return None
     return APIInferenceProvider(
-        api_key=key, base_url=str(base_url), model=str(model)
+        api_key=key, base_url=str(base_url), model=str(model),
+        redactor=Redactor(secrets),
     )
 
 
@@ -48,45 +51,58 @@ class APIInferenceProvider(InferenceProvider):
         base_url: str = DEFAULT_BASE_URL,
         model: str = "gpt-4o-mini",
         redactor: Redactor | None = None,
+        timeout: float = DEFAULT_REQUEST_TIMEOUT,
     ) -> None:
+        if timeout <= 0:
+            raise ValueError("provider timeout must be positive")
+        self._timeout = timeout
         self._api_key = api_key
         self._base_url = base_url.rstrip("/")
         self._model = model
-        self._guard = EgressGuard(redactor)
+        self._redactor = redactor
+        self._guard = EgressGuard(scrubber=self._scrub)
 
     # -- transport ---------------------------------------------------------
 
     def _chat(self, system: str, user: str) -> str:
         body = json.dumps(
             {
-                "model": self._model,
+                "model": self._scrub(self._model),
                 "messages": [
-                    {"role": "system", "content": system},
-                    {"role": "user", "content": user},
+                    {"role": "system", "content": self._scrub(system)},
+                    {"role": "user", "content": self._scrub(user)},
                 ],
             }
         ).encode()
-        request = urllib.request.Request(
-            f"{self._base_url}/chat/completions",
-            data=body,
-            headers={
-                "Content-Type": "application/json",
-                "Authorization": f"Bearer {self._api_key}",
-            },
-            method="POST",
-        )
         try:
-            with urllib.request.urlopen(request, timeout=60) as response:
+            request = urllib.request.Request(
+                f"{self._base_url}/chat/completions",
+                data=body,
+                headers={
+                    "Content-Type": "application/json",
+                    "Authorization": f"Bearer {self._api_key}",
+                },
+                method="POST",
+            )
+            with authenticated_urlopen(request, timeout=self._timeout) as response:
                 payload = json.loads(response.read().decode())
         except urllib.error.HTTPError as error:
-            detail = error.read().decode(errors="replace")[:200]
+            detail = self._scrub(error.read().decode(errors="replace"))[:200]
             raise ProviderError(f"model API error {error.code}: {detail}") from error
         except (urllib.error.URLError, TimeoutError, OSError, ValueError) as error:
-            raise ProviderError(f"model API unreachable: {error}") from error
+            raise ProviderError(self._scrub(f"model API unreachable: {error}")) from error
         try:
-            return payload["choices"][0]["message"]["content"]
+            content = payload["choices"][0]["message"]["content"]
+            if not isinstance(content, str):
+                raise TypeError("message content is not text")
+            return self._scrub(content)
         except (KeyError, IndexError, TypeError) as error:
             raise ProviderError(f"unexpected model API shape: {error}") from error
+
+    def _scrub(self, text: str) -> str:
+        # A directly constructed provider still protects its own API key.
+        text = self._redactor.scrub(text) if self._redactor else text
+        return text.replace(self._api_key, "***") if self._api_key else text
 
     # -- port ---------------------------------------------------------------
 
@@ -110,11 +126,22 @@ class APIInferenceProvider(InferenceProvider):
             user=json.dumps(payload),
         )
         try:
-            parsed = json.loads(content)
+            structured = content.strip()
+            if structured.startswith("```"):
+                lines = structured.splitlines()
+                if len(lines) >= 3 and lines[0].lower() in {"```", "```json"} and lines[-1] == "```":
+                    structured = "\n".join(lines[1:-1])
+            parsed = json.loads(structured)
+            if not isinstance(parsed, dict) or not all(
+                isinstance(parsed.get(field), str) and parsed[field].strip()
+                for field in ("target", "purpose")
+            ):
+                raise ValueError("target and purpose must be nonempty strings")
+            clean = {field: self._scrub(parsed[field]) for field in ("target", "purpose")}
             return TaskDraft(
-                target=str(parsed["target"]),
-                purpose=str(parsed["purpose"]),
-                raw=content,
+                target=clean["target"],
+                purpose=clean["purpose"],
+                raw=json.dumps(clean),
             )
-        except (json.JSONDecodeError, KeyError, TypeError) as error:
+        except (ValueError, KeyError, TypeError) as error:
             raise ProviderError(f"model intent not parseable: {error}") from error
