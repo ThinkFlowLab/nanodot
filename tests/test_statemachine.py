@@ -106,6 +106,7 @@ def test_new_commit_mid_watch_emits_reset_event() -> None:
     task, events = stepped(fake, task, now=1200.0)
     kinds = [e.kind for e in events]
     assert NEW_COMMIT in kinds
+    assert CHECKS_FAILED in kinds
     assert task.watch_state["last_sha"] == "s2"
 
 
