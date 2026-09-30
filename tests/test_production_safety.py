@@ -170,6 +170,11 @@ def test_secret_hidden_prompt(home, monkeypatch, capsys):
     assert SECRET not in capsys.readouterr().out
 
 
+@pytest.mark.parametrize("mode", ["gated", "auto", "typo"])
+def test_cli_rejects_unimplemented_modes(home, capsys, mode):
+    assert main(["config", "set", "mode", mode]) == 1
+    assert Config().get("mode") is None
+    assert "readonly" in capsys.readouterr().err
 
 
 @pytest.mark.parametrize("flag", ["--notify", "--stop"])

@@ -18,6 +18,7 @@ from dataclasses import dataclass, field, replace
 from enum import Enum
 from pathlib import Path
 
+from nanodot.core.permissions import invalidate_task_grants
 from nanodot.core.redaction import Redactor
 from nanodot.paths import database_path
 
@@ -283,6 +284,7 @@ class TaskStore:
             ) or task.scope_version > current.scope_version
             if scope_changed:
                 task.scope_version = current.scope_version + 1
+                invalidate_task_grants(self._conn, task.id, task.updated_at)
             else:
                 task.scope_version = current.scope_version
             self._conn.execute(
