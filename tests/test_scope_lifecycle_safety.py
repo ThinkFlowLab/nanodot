@@ -8,6 +8,9 @@ from nanodot.core.tasks import (
     DEFAULT_STOP_CONDITIONS, SUPPORTED_NOTIFICATION_CONDITIONS,
     SUPPORTED_STOP_CONDITIONS, PRTarget, Task, TaskError, TaskState, TaskStore,
 )
+from fakes import FakeGitHub, FAILURE, QUEUED, SUCCESS, TYPICAL_ERRORS
+from nanodot.core.statemachine import CHECKS_FAILED, CHECKS_PASSED, CHECKS_PENDING, step
+from nanodot.ports.github import RequiredCheck
 
 
 TARGET = PRTarget.parse("owner/repo#1")
@@ -139,6 +142,68 @@ def test_scope_error_does_not_echo_rejected_secret(home):
     assert secret.encode() not in (home / "nanodot.db").read_bytes()
 
 
+@pytest.mark.parametrize("field,value", UNSUPPORTED)
+def test_direct_step_rejects_unsupported_scope(field, value):
+    task = make_task(**{field: value})
+    fake = FakeGitHub(TARGET)
+    fake.set_pr("open", head_sha="s1")
+    fake.add_check("ci", SUCCESS, sha="s1")
+    with pytest.raises(TaskError, match="unsupported"):
+        step(task, fake.snapshot(), now=1000.0)
+    assert task.watch_state == {}
+
+
+def test_failure_recurrence_gets_new_occurrence_on_same_sha():
+    fake = FakeGitHub(TARGET)
+    fake.set_pr("open", head_sha="s1")
+    fake.add_check("ci", FAILURE, sha="s1")
+    task = make_task()
+    task.watch_state, first = step(task, fake.snapshot(), 1000.0)
+    first_id = first[0].occurrence
+    assert first_id
+    fake.checks["s1"] = []
+    fake.add_check("ci", None, sha="s1", status=QUEUED)
+    task.watch_state, pending = step(task, fake.snapshot(), 1100.0)
+    assert pending[0].occurrence != first_id
+    fake.checks["s1"] = []
+    fake.add_check("ci", FAILURE, sha="s1")
+    task.watch_state, recurrence = step(task, fake.snapshot(), 1200.0)
+    assert [e.kind for e in recurrence] == [CHECKS_FAILED]
+    assert recurrence[0].occurrence != first_id
+    assert recurrence[0].evidence == first[0].evidence
+    _, unchanged = step(task, fake.snapshot(), 1300.0)
+    assert unchanged == []
+
+
+def test_uncommitted_transition_replay_has_stable_occurrence():
+    fake = FakeGitHub(TARGET)
+    fake.add_check("ci", FAILURE, sha="sha-1")
+    task = make_task()
+    first_state, first = step(task, fake.snapshot(), 1000.0)
+    replay_state, replay = step(task, fake.snapshot(), 2000.0)
+    assert replay[0].occurrence == first[0].occurrence
+    assert replay_state["event_sequence"] == first_state["event_sequence"]
+    assert task.watch_state == {}
+
+
+@pytest.mark.parametrize("required,complete,message", [
+    (None, True, "rules unavailable or unsupported"),
+    ((RequiredCheck("ci"),), False, "results incomplete"),
+    ((), True, "no required checks configured"),
+])
+def test_unknown_or_empty_required_rules_are_visible_without_success(required, complete, message):
+    fake = FakeGitHub(TARGET)
+    fake.add_check("ci", SUCCESS, sha="sha-1")
+    snapshot = replace(fake.snapshot(), required_checks=required, checks_complete=complete)
+    task = make_task()
+    task.watch_state, events = step(task, snapshot, 1000.0)
+    assert [e.kind for e in events] == [CHECKS_PENDING]
+    assert message in events[0].message
+    assert not events[0].terminal and not events[0].notable
+    assert not task.watch_state.get("terminal")
+    assert step(task, snapshot, 1100.0)[1] == []
+
+
 def test_stale_update_cannot_undo_pause_or_scope_change(home):
     store = TaskStore()
     task = store.create(make_task())
@@ -158,6 +223,16 @@ def test_empty_allowed_actions_cannot_authorize_a_read(home):
     with pytest.raises(TaskError, match="requires the read action"):
         store.create(make_task(allowed_actions=()))
     assert store.list() == []
+
+
+@pytest.mark.parametrize("conclusion", ["error", "stale"])
+def test_failure_names_use_same_conclusions_as_evaluator(conclusion):
+    task = make_task()
+    github = FakeGitHub(TARGET)
+    github.add_check("required-job", conclusion, sha=github.head_sha)
+    _, events = step(task, github.snapshot(), now=1000)
+    failed = next(event for event in events if event.kind == CHECKS_FAILED)
+    assert "required-job" in failed.message
 
 
 def test_secret_target_rejected_on_create_update_and_scheduling(home):
