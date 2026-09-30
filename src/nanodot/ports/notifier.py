@@ -9,6 +9,7 @@ from nanodot.core.statemachine import WatchEvent
 
 class NotificationSink(Protocol):
     """Delivers notable/terminal events. Must be idempotent per event —
-    dedup policy lives in core, implementations just deliver."""
+    core identifies transitions and durable occurrence IDs; sinks deduplicate
+    delivery of the same occurrence across retries and restarts."""
 
     def notify(self, event: WatchEvent) -> None: ...

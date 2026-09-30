@@ -27,6 +27,7 @@ from nanodot.core.memory import MemoryStore
 from nanodot.core.redaction import Redactor
 from nanodot.core.runner import RunOutcome, TaskLoop
 from nanodot.core.statemachine import CHECKS_FAILED, CHECKS_PASSED, NEW_COMMIT
+from nanodot.core.tasks import DEFAULT_NOTIFICATION_CONDITIONS, DEFAULT_STOP_CONDITIONS
 from nanodot.core.tasks import PRTarget, Task, TaskState, TaskStore
 from nanodot.native.daemon import RunnerDaemon
 from nanodot.native.notifier import NativeNotifier
@@ -115,18 +116,15 @@ def e2e(home: Path) -> E2E:
 
 
 def test_scenario_1_create_inspect_initial_result(e2e: E2E) -> None:
-    task = e2e.watch(
-        notification_conditions="failures and terminal outcomes",
-        stop_conditions="checks pass on current SHA, merge, or close",
-    )
+    task = e2e.watch()
     saved = e2e.store.get(task.id)
     assert saved is not None
     assert str(saved.target) == str(TARGET)
     assert saved.purpose == "tell me when required checks pass"
     assert saved.cadence_seconds == CADENCE
     assert saved.allowed_actions == ("read",)
-    assert saved.notification_conditions == "failures and terminal outcomes"
-    assert "current SHA" in saved.stop_conditions
+    assert saved.notification_conditions == DEFAULT_NOTIFICATION_CONDITIONS
+    assert saved.stop_conditions == DEFAULT_STOP_CONDITIONS
 
     e2e.github.add_check("ci", None, sha="s1", status=QUEUED)
     assert e2e.tick() == 1
@@ -257,9 +255,7 @@ def test_scenario_5_failures_rate_limit_lost_auth(e2e: E2E) -> None:
     # User fixes the token and resumes; the watch continues.
     e2e.github.fail_with(None)
     e2e.github.add_check("ci", SUCCESS, sha="s1")
-    resumed = e2e.store.resume(task.id)
-    resumed.next_check_at = e2e.clock.now
-    e2e.store.update(resumed)
+    e2e.store.resume(task.id, now=e2e.clock.now)
     e2e.tick()
     assert e2e.store.get(task.id).state is TaskState.COMPLETED
 
@@ -275,10 +271,7 @@ def test_scenario_6_pause_resume_cancel_terminal(e2e: E2E) -> None:
     e2e.clock.advance(10 * CADENCE)
     assert e2e.tick() == 0  # paused: never scheduled
 
-    e2e.store.resume(task.id)
-    resumed = e2e.store.get(task.id)
-    resumed.next_check_at = e2e.clock.now
-    e2e.store.update(resumed)
+    e2e.store.resume(task.id, now=e2e.clock.now)
     assert e2e.tick() == 1
 
     other = e2e.watch()

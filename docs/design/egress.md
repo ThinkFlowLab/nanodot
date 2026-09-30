@@ -8,7 +8,8 @@ only through their ports:
 
 - **Destination:** `api.github.com` (read-only REST).
 - **Content:** repository/PR identifiers, and the responses (check names,
-  statuses, conclusions, head SHAs). Request paths only — no POST/PUT/
+  statuses, conclusions, head SHAs), applicable branch/ruleset requirements,
+  and workflow event metadata. Request paths only — no POST/PUT/
   PATCH/DELETE is ever issued by the GitHub client.
 - **Credential:** the read-only PAT travels in the `Authorization` header
   and exists nowhere else outside the secret store.
@@ -24,7 +25,9 @@ there is structurally no way to attach anything else:
 - **parse_intent:** `intent_text` — the sentence the user just typed.
 - **Never:** credentials, tokens, task-store contents, memory items,
   activity history, inbox contents, file paths.
-- Known secret values are additionally scrubbed from every outbound value.
+- Known secret values are additionally scrubbed recursively from every outbound
+  value, including check names and nested evidence. The production factory
+  supplies the configured secret store to the redactor.
 
 If the model is an API model, the above data leaves the host to that
 provider; the API key travels only in the `Authorization` header. A local
@@ -33,3 +36,8 @@ code changes.
 
 Everything else — scheduling, state transitions, commit-pinning, dedup,
 memory writes, redaction — happens locally.
+
+Optional provider summaries wait at most one second in the scheduler. At most
+one summary call is in flight; late responses are discarded. Native HTTP calls
+use a five-second timeout. Python cannot forcibly cancel an arbitrary provider,
+so a still-running call suppresses further summaries while raw events continue.

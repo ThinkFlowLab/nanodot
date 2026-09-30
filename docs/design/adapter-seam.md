@@ -41,7 +41,8 @@ provide fakes; a future adapter would be another implementation.
 ### 2. GitHub snapshot fetch
 
 - **Purpose:** return a commit-pinned view of a PR: open/merged/closed
-  state, current head SHA, and check runs keyed to that SHA.
+  state, current head SHA, and complete check/status results keyed to that SHA, with known required-check
+  metadata from the base branch. Unknown metadata cannot prove success.
 - **Interface sketch:** `fetch(task) -> Snapshot | FetchError`
   (`FetchError` typed as retryable / auth-lost / not-found).
 - **Native implementation:** read-only REST client with a read-only PAT (#6).
@@ -55,8 +56,8 @@ provide fakes; a future adapter would be another implementation.
 - **Interface sketch:** `notify(event) -> None`, idempotent per event key.
 - **Native implementation:** deduplicated persisted inbox + macOS
   notification (#9). Slack/email would be further implementations.
-- **An adapter would implement:** delivery through another channel; dedup
-  policy stays in core.
+- **An adapter would implement:** delivery through another channel; transition identity stays in core; sinks retain delivery
+  deduplication by durable occurrence identity across retries and restarts.
 
 ### 4. Inference provider
 
