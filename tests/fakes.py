@@ -14,6 +14,7 @@ from nanodot.ports.github import (
     CheckRun,
     PRNotFoundError,
     RetryableError,
+    RequiredCheck,
     Snapshot,
     SnapshotFetcher,
 )
@@ -63,6 +64,11 @@ class FakeGitHub(SnapshotFetcher):
                 if sha != self.head_sha
                 for run in runs
             ),
+            required_checks=tuple(
+                RequiredCheck(name=run.name)
+                for run in self.checks.get(self.head_sha, ())
+            ),
+            checks_complete=True,
             fetched_at=time.time(),
             url=f"https://github.com/{self.target.owner}/{self.target.repo}"
             f"/pull/{self.target.number}",
@@ -72,6 +78,19 @@ class FakeGitHub(SnapshotFetcher):
         if self.error is not None:
             raise self.error
         return self.snapshot()
+
+
+class FakeSink:
+    """Records every notified event for assertions."""
+
+    def __init__(self) -> None:
+        self.events: list = []
+
+    def notify(self, event) -> None:
+        self.events.append(event)
+
+    def kinds(self) -> list[str]:
+        return [event.kind for event in self.events]
 
 
 class FakeClock:
