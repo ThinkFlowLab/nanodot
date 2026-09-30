@@ -8,6 +8,7 @@ scheduler/executor port (see adapter-seam.md) drives `run_once`.
 from __future__ import annotations
 
 import threading
+from dataclasses import replace
 from enum import Enum
 
 from nanodot.core import statemachine
@@ -21,10 +22,77 @@ from nanodot.ports.github import (
     RetryableError,
     SnapshotFetcher,
 )
+from nanodot.ports.inference import InferenceProvider, StateChange
 from nanodot.ports.notifier import NotificationSink
 
 MAX_BACKOFF_SECONDS = 3600
 PROLONGED_FAILURE_SECONDS = 3600
+SUMMARY_BUDGET_SECONDS = 1.0
+
+
+def state_change_from_event(event: WatchEvent) -> StateChange:
+    """The whitelisted evidence for a summary, from an event."""
+    checks = tuple(
+        (check.get("name", ""), check.get("conclusion"))
+        for check in event.evidence.get("checks", [])
+    )
+    return StateChange(
+        kind=event.kind,
+        summary=event.message,
+        head_sha=event.evidence.get("head_sha", ""),
+        pr_state=event.evidence.get("pr_state", ""),
+        url=event.evidence.get("url", ""),
+        checks=checks,
+    )
+
+
+def safe_summarize(provider: InferenceProvider, event: WatchEvent) -> str | None:
+    """Summarize through the provider; degrade to None on any failure.
+    The summary decorates the notification — the raw message is the truth."""
+    try:
+        return provider.summarize(state_change_from_event(event))
+    except Exception:
+        # Optional decoration must never interrupt core checking, even for
+        # a malformed third-party provider implementation.
+        return None
+
+
+class _SummaryBudget:
+    """At most one optional call in flight; overdue summaries are discarded.
+
+    A daemon thread bounds scheduler wait even for a misbehaving adapter.
+    Python cannot forcibly cancel arbitrary calls, so subsequent summaries
+    are skipped until that call finishes rather than spawning more threads.
+    """
+
+    def __init__(self, seconds: float) -> None:
+        if seconds < 0:
+            raise ValueError("summary budget must not be negative")
+        self._seconds = seconds
+        self._inflight = threading.Lock()
+
+    def summarize(self, provider: InferenceProvider, event: WatchEvent) -> str | None:
+        if not self._inflight.acquire(blocking=False):
+            return None
+        completed = threading.Event()
+        result: list[str | None] = []
+
+        def work() -> None:
+            try:
+                result.append(safe_summarize(provider, event))
+            finally:
+                self._inflight.release()
+                completed.set()
+
+        worker = threading.Thread(target=work, name="nanodot-summary", daemon=True)
+        try:
+            worker.start()
+        except Exception:
+            self._inflight.release()
+            return None
+        if not completed.wait(self._seconds):
+            return None
+        return result[0] if result else None
 
 
 class RunOutcome(str, Enum):
@@ -50,11 +118,15 @@ class TaskLoop:
         fetcher: SnapshotFetcher,
         sink: NotificationSink,
         activity: ActivityLog,
+        provider: InferenceProvider | None = None,
+        summary_budget_seconds: float = SUMMARY_BUDGET_SECONDS,
     ) -> None:
         self._store = store
         self._fetcher = fetcher
         self._sink = sink
         self._activity = activity
+        self._provider = provider
+        self._summaries = _SummaryBudget(summary_budget_seconds)
         self._locks: dict[str, threading.Lock] = {}
         self._locks_guard = threading.Lock()
 
@@ -141,6 +213,10 @@ class TaskLoop:
         task.watch_state = watch_state
 
         for event in events:
+            if event.notable and self._provider is not None:
+                summary = self._summaries.summarize(self._provider, event)
+                if summary:
+                    event = replace(event, summary=summary)
             if skipped := self._superseded(task):
                 return skipped
             self._activity.append(

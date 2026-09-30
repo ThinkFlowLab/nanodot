@@ -56,6 +56,8 @@ def build_parser() -> argparse.ArgumentParser:
     add = watch_sub.add_parser("add", help="create a watch on one PR")
     add.add_argument("target", nargs="?", help="owner/repo#number")
     add.add_argument("--purpose", default="tell me when required checks pass")
+    add.add_argument("--intent", help="describe the watch in one sentence; a "
+                     "configured model parses it into target + purpose")
     add.add_argument("--cadence", type=int, default=DEFAULT_CADENCE,
                      help="seconds between checks (default 300)")
     add.add_argument("--notify", default=DEFAULT_NOTIFICATION_CONDITIONS,
@@ -95,6 +97,7 @@ def _wiring() -> tuple:
     from nanodot.core.runner import TaskLoop
     from nanodot.core.tasks import TaskStore
     from nanodot.native.github_client import GitHubSnapshotFetcher
+    from nanodot.native.inference_api import configured_provider
     from nanodot.native.notifier import NativeNotifier
     from nanodot.native.secrets_file import FileSecretStore
 
@@ -104,7 +107,10 @@ def _wiring() -> tuple:
     activity = ActivityLog(redactor=redactor)
     sink = NativeNotifier(redactor=redactor, os_notify=_os_notifications_enabled())
     fetcher = GitHubSnapshotFetcher()
-    loop = TaskLoop(store, fetcher, sink, activity)
+    loop = TaskLoop(
+        store, fetcher, sink, activity,
+        provider=configured_provider(),
+    )
     return secrets, store, activity, sink, fetcher, loop
 
 
@@ -193,6 +199,22 @@ def _run_watch(args: argparse.Namespace) -> int:
 
         target_text = args.target or ""
         purpose = args.purpose
+        if args.intent:
+            from nanodot.native.inference_api import configured_provider
+            from nanodot.ports.inference import ProviderError
+
+            provider = configured_provider()
+            if provider is None:
+                print("note: no model configured (api-key, model-base-url, "
+                      "model-name); ignoring --intent", file=sys.stderr)
+            else:
+                try:
+                    draft = provider.parse_intent(args.intent)
+                    target_text = target_text or draft.target
+                    purpose = draft.purpose or purpose
+                except ProviderError as error:
+                    print(f"note: intent parsing failed ({error}); "
+                          "continuing with explicit arguments", file=sys.stderr)
         if not target_text:
             print("error: a target is required: owner/repo#number",
                   file=sys.stderr)

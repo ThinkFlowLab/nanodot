@@ -11,18 +11,62 @@ from nanodot.core.activity import ActivityLog
 from nanodot.core.config import Config
 from nanodot.core.redaction import Redactor
 from nanodot.core.tasks import TaskStore
+from nanodot.native.inference_api import APIInferenceProvider, configured_provider
 from nanodot.native.secrets_file import FileSecretStore
+from nanodot.ports.inference import ProviderError, StateChange
 
 SECRET = "ghp-production-redaction-123"
 API_KEY = "sk-production-redaction-456"
 
 
+def response(text):
+    return io.BytesIO(json.dumps({"choices": [{"message": {"content": text}}]}).encode())
 
 
+def configured(home):
+    secrets = FileSecretStore()
+    secrets.set("github-token", SECRET)
+    secrets.set("api-key", API_KEY)
+    Config().set("model-base-url", "https://model.test/v1")
+    Config().set("model-name", "test-model")
+    return configured_provider()
 
 
+def test_real_provider_factory_scrubs_every_outbound_value(home, monkeypatch):
+    provider = configured(home)
+    requests = []
+
+    def urlopen(request, **kwargs):
+        requests.append(request)
+        return response(f"redact {SECRET}")
+
+    monkeypatch.setattr("nanodot.native.inference_api.authenticated_urlopen", urlopen)
+    assert provider.summarize(StateChange(
+        kind=SECRET, summary=SECRET, head_sha=SECRET,
+        pr_state=SECRET, url=f"https://example.test/{SECRET}",
+        checks=((f"ci-{SECRET}", SECRET),),
+    )) == "redact ***"
+    raw = requests[0].data.decode()
+    assert SECRET not in raw
+    assert API_KEY not in raw
+    assert requests[0].headers["Authorization"] == f"Bearer {API_KEY}"
 
 
+def test_real_cli_intent_scrubs_input_output_and_retained_task(home, monkeypatch, capsys):
+    configured(home)
+    bodies = []
+
+    def urlopen(request, **kwargs):
+        bodies.append(request.data.decode())
+        return response(json.dumps({"target": "o/r#1", "purpose": f"watch {SECRET}"}))
+
+    monkeypatch.setattr("nanodot.native.inference_api.authenticated_urlopen", urlopen)
+    assert main(["watch", "add", "--intent", f"watch with {SECRET}", "--yes"]) == 0
+    assert len(bodies) == 1
+    assert SECRET not in bodies[0]
+    assert SECRET not in capsys.readouterr().out
+    assert SECRET not in TaskStore().list()[0].purpose
+    assert SECRET.encode() not in (home / "nanodot.db").read_bytes()
 
 
 
@@ -37,12 +81,47 @@ def test_nested_redaction_preserves_input_and_scrubs_longest_secret(home):
     assert original["abcdef"]["checks"][0]["name"] == "abcdef"
 
 
+def test_provider_errors_do_not_echo_known_secrets(home, monkeypatch):
+    provider = configured(home)
+
+    def urlopen(request, **kwargs):
+        raise urllib.error.HTTPError(request.full_url, 503, "bad", {}, io.BytesIO(SECRET.encode()))
+
+    monkeypatch.setattr("nanodot.native.inference_api.authenticated_urlopen", urlopen)
+    with pytest.raises(ProviderError) as error:
+        provider.parse_intent("watch o/r#1")
+    assert SECRET not in str(error.value)
 
 
+@pytest.mark.parametrize("fence", ["json", ""])
+def test_provider_accepts_fenced_json(home, monkeypatch, fence):
+    provider = configured(home)
+    monkeypatch.setattr("nanodot.native.inference_api.authenticated_urlopen", lambda *a, **k: response(
+        f'```{fence}\n{{"target": "o/r#1", "purpose": "watch"}}\n```'
+    ))
+    assert provider.parse_intent("watch").target == "o/r#1"
 
 
+@pytest.mark.parametrize("content", [None, {}, [], 7])
+def test_non_text_provider_content_is_typed_error(home, monkeypatch, content):
+    provider = configured(home)
+    monkeypatch.setattr("nanodot.native.inference_api.authenticated_urlopen", lambda *a, **k: response(content))
+    with pytest.raises(ProviderError):
+        provider.summarize(StateChange(kind="test", summary="test"))
 
 
+def test_direct_provider_protects_own_key_and_bounds_http_timeout(home, monkeypatch):
+    calls = []
+    provider = APIInferenceProvider(api_key=API_KEY)
+
+    def urlopen(request, **kwargs):
+        calls.append((request, kwargs))
+        return response("summary")
+
+    monkeypatch.setattr("nanodot.native.inference_api.authenticated_urlopen", urlopen)
+    provider.summarize(StateChange(kind="test", summary=API_KEY))
+    assert API_KEY not in calls[0][0].data.decode()
+    assert calls[0][1]["timeout"] <= 5
 
 
 def test_secret_stdin_input_does_not_echo(home, monkeypatch, capsys):
@@ -85,6 +164,7 @@ def test_watch_listing_does_not_construct_fetcher_provider_notifier(home, monkey
     def forbidden(*a, **k):
         raise AssertionError("read-only list must not initialize adapters")
 
+    monkeypatch.setattr("nanodot.native.inference_api.configured_provider", forbidden)
     monkeypatch.setattr("nanodot.native.notifier.NativeNotifier", forbidden)
     monkeypatch.setattr("nanodot.native.github_client.GitHubSnapshotFetcher", forbidden)
     assert main(["watch", "list"]) == 0
@@ -115,7 +195,36 @@ def test_cli_rejects_secret_in_target_without_display_or_persistence(home, capsy
     assert TaskStore().list() == []
 
 
+def test_invalid_provider_url_degrades_to_explicit_cli_target(home, capsys):
+    configured(home)
+    Config().set("model-base-url", "bad url")
+    assert main(["watch", "add", "o/r#1", "--intent", "watch o/r#1", "--yes"]) == 0
+    assert "intent parsing failed" in capsys.readouterr().err
+    assert len(TaskStore().list()) == 1
 
 
+def test_direct_provider_escaped_key_scrubbed_before_serialization(home, monkeypatch):
+    key = 'key"with\\quotes\nand-newline'
+    provider = APIInferenceProvider(api_key=key)
+    bodies = []
+
+    def urlopen(request, **kwargs):
+        bodies.append(json.loads(request.data))
+        return response("summary")
+
+    monkeypatch.setattr("nanodot.native.inference_api.authenticated_urlopen", urlopen)
+    provider.summarize(StateChange(kind="x", summary=key, checks=((key, "failure"),)))
+    payload = json.loads(bodies[0]["messages"][1]["content"])
+    assert payload["summary"] == "***"
+    assert payload["checks"][0]["name"] == "***"
 
 
+def test_direct_provider_intent_fields_and_raw_scrub_decoded_key(home, monkeypatch):
+    key = 'key"with\\quotes'
+    provider = APIInferenceProvider(api_key=key)
+    monkeypatch.setattr("nanodot.native.inference_api.authenticated_urlopen", lambda *a, **k: response(
+        json.dumps({"target": "o/r#1", "purpose": key, "ignored": key})
+    ))
+    draft = provider.parse_intent("watch")
+    assert draft.purpose == "***"
+    assert json.loads(draft.raw) == {"target": "o/r#1", "purpose": "***"}

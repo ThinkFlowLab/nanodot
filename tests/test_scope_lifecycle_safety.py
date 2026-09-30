@@ -2,22 +2,21 @@
 
 from dataclasses import replace
 import sqlite3
+from pathlib import Path
 
 import pytest
+from fakes import FakeGitHub, FAILURE, QUEUED, SUCCESS, TYPICAL_ERRORS
+from test_runner import Harness
+
+from nanodot.core.runner import RunOutcome, TaskLoop
+from nanodot.core.statemachine import CHECKS_FAILED, CHECKS_PASSED, CHECKS_PENDING, step
 from nanodot.core.tasks import (
     DEFAULT_STOP_CONDITIONS, SUPPORTED_NOTIFICATION_CONDITIONS,
     SUPPORTED_STOP_CONDITIONS, PRTarget, Task, TaskError, TaskState, TaskStore,
 )
-from fakes import FakeGitHub, FAILURE, QUEUED, SUCCESS, TYPICAL_ERRORS
-from nanodot.core.statemachine import CHECKS_FAILED, CHECKS_PASSED, CHECKS_PENDING, step
 from nanodot.ports.github import RequiredCheck
-from test_runner import Harness
-from nanodot.core.runner import RunOutcome, TaskLoop
-
 
 TARGET = PRTarget.parse("owner/repo#1")
-
-
 UNSUPPORTED = [
     ("notification_conditions", "only failures"),
     ("notification_conditions", "never notify"),
@@ -271,6 +270,8 @@ def test_lifecycle_change_during_fetch_prevents_delivery_and_stale_write(home, c
         assert saved.state is (TaskState.PAUSED if change == "pause" else TaskState.CANCELLED)
 
 
+
+
 def test_failure_occurrence_survives_restart(home):
     h = Harness(home)
     h.github.add_check("ci", FAILURE, sha="s1")
@@ -287,6 +288,32 @@ def test_failure_occurrence_survives_restart(home):
     h.tick()
     assert h.sink.kinds() == [CHECKS_FAILED, CHECKS_FAILED]
     assert h.sink.events[-1].occurrence != first_id
+
+
+@pytest.mark.parametrize("change", ["pause", "cancel", "scope"])
+def test_lifecycle_change_during_summary_prevents_notification_and_write(home, change):
+    h = Harness(home)
+    h.github.add_check("ci", SUCCESS, sha="s1")
+
+    class ChangingProvider:
+        def summarize(self, change_event):
+            if change == "scope":
+                h.store.update_scope(h.task.id, cadence_seconds=600)
+            else:
+                getattr(h.store, change)(h.task.id)
+            return "finished"
+
+    h.loop = TaskLoop(h.store, h.github, h.sink, h.activity, provider=ChangingProvider())
+    expected = {
+        "pause": RunOutcome.SKIPPED_INACTIVE,
+        "cancel": RunOutcome.SKIPPED_TERMINAL,
+        "scope": RunOutcome.SKIPPED_SCOPE_CHANGED,
+    }[change]
+    assert h.tick() is expected
+    assert h.sink.events == []
+    assert h.activity.query(task_id=h.task.id) == []
+    saved = h.store.get(h.task.id)
+    assert not saved.watch_state.get("terminal")
 
 
 def test_stale_update_cannot_undo_pause_or_scope_change(home):
@@ -357,4 +384,3 @@ def test_failure_names_use_same_conclusions_as_evaluator(conclusion):
     _, events = step(task, github.snapshot(), now=1000)
     failed = next(event for event in events if event.kind == CHECKS_FAILED)
     assert "required-job" in failed.message
-

@@ -18,6 +18,7 @@ from nanodot.ports.github import (
     Snapshot,
     SnapshotFetcher,
 )
+from nanodot.ports.inference import ProviderError, TaskDraft
 
 SUCCESS = "success"
 FAILURE = "failure"
@@ -78,6 +79,31 @@ class FakeGitHub(SnapshotFetcher):
         if self.error is not None:
             raise self.error
         return self.snapshot()
+
+
+class FakeProvider:
+    """Scriptable inference provider: records egress, returns canned
+    answers, can be told to fail (degraded-mode tests)."""
+
+    def __init__(self) -> None:
+        self.summarize_payloads: list = []
+        self.intent_payloads: list = []
+        self.summaries: list[str] = ["A short model summary."]
+        self.fail_summaries = False
+        self.fail_intent = False
+        self.draft = TaskDraft(target="owner/repo#1", purpose="watch checks")
+
+    def summarize(self, change) -> str:
+        self.summarize_payloads.append(change)
+        if self.fail_summaries:
+            raise ProviderError("provider down")
+        return self.summaries[0]
+
+    def parse_intent(self, text: str) -> TaskDraft:
+        self.intent_payloads.append(text)
+        if self.fail_intent:
+            raise ProviderError("provider down")
+        return self.draft
 
 
 class FakeSink:
