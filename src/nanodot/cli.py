@@ -4,6 +4,7 @@ a local web UI can layer on the same core later."""
 from __future__ import annotations
 
 import argparse
+import getpass
 import sys
 
 from nanodot import __version__
@@ -23,7 +24,8 @@ def build_parser() -> argparse.ArgumentParser:
     config_sub = config.add_subparsers(dest="config_command", required=True)
     config_set = config_sub.add_parser("set", help="set a value")
     config_set.add_argument("name")
-    config_set.add_argument("value")
+    config_set.add_argument("value", nargs="?", help="value; use - for stdin, "
+                            "or omit a secret value for a hidden prompt")
     config_unset = config_sub.add_parser("unset", help="remove a value")
     config_unset.add_argument("name")
     config_sub.add_parser("list", help="list configured values (secrets masked)")
@@ -39,17 +41,35 @@ def _run_config(args: argparse.Namespace) -> int:
     config = Config()
     store = FileSecretStore()
     if args.config_command == "set":
+        value = args.value
+        if value == "-":
+            value = sys.stdin.readline().rstrip("\r\n")
+        elif value is None and is_secret_name(args.name):
+            if not sys.stdin.isatty():
+                print("error: use - to read a secret from stdin", file=sys.stderr)
+                return 1
+            value = getpass.getpass(f"{args.name}: ")
+        if value is None or (is_secret_name(args.name) and not value):
+            print("error: a nonempty value is required", file=sys.stderr)
+            return 1
         if is_secret_name(args.name):
-            store.set(args.name, args.value)
+            store.set(args.name, value)
+            config.unset(args.name)  # remove a legacy plaintext copy after safe save
         else:
-            config.set(args.name, args.value)
+            try:
+                config.set(args.name, value)
+            except ValueError as error:
+                print(f"error: {error}", file=sys.stderr)
+                return 1
     elif args.config_command == "unset":
         if is_secret_name(args.name):
             store.unset(args.name)
+            config.unset(args.name)
         else:
             config.unset(args.name)
     else:  # list
-        rows = [(key, str(config.get(key))) for key in config.keys()]
+        rows = [(key, MASK if is_secret_name(key) else str(config.get(key)))
+                for key in config.keys() if key not in store.names()]
         rows += [(name, MASK) for name in store.names()]
         for key, value in sorted(rows):
             print(f"{key}={value}")
