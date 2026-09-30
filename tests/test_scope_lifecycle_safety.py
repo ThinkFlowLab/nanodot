@@ -11,6 +11,8 @@ from nanodot.core.tasks import (
 from fakes import FakeGitHub, FAILURE, QUEUED, SUCCESS, TYPICAL_ERRORS
 from nanodot.core.statemachine import CHECKS_FAILED, CHECKS_PASSED, CHECKS_PENDING, step
 from nanodot.ports.github import RequiredCheck
+from test_runner import Harness
+from nanodot.core.runner import RunOutcome, TaskLoop
 
 
 TARGET = PRTarget.parse("owner/repo#1")
@@ -204,6 +206,89 @@ def test_unknown_or_empty_required_rules_are_visible_without_success(required, c
     assert step(task, snapshot, 1100.0)[1] == []
 
 
+@pytest.mark.parametrize("field,value", UNSUPPORTED)
+def test_direct_runner_blocks_invalid_scope_before_fetch(home, field, value):
+    h = Harness(home)
+    h.github.add_check("ci", SUCCESS, sha="s1")
+    setattr(h.task, field, value)
+    assert h.loop.run_once(h.task, h.clock.now) is RunOutcome.BLOCKED
+    assert h.github.fetch_calls == 0
+    assert h.sink.events == []
+    assert h.store.get(h.task.id).state is TaskState.BLOCKED
+
+
+def test_runner_checks_saved_scope_even_with_stale_valid_input(home):
+    h = Harness(home)
+    with sqlite3.connect(home / "nanodot.db") as conn:
+        conn.execute("UPDATE tasks SET notification_conditions='never notify' WHERE id=?", (h.task.id,))
+    assert h.loop.run_once(h.task, h.clock.now) is RunOutcome.BLOCKED
+    assert h.github.fetch_calls == 0
+    assert h.sink.events == []
+    assert "unsupported" in h.store.get(h.task.id).blocker
+
+
+@pytest.mark.parametrize("lifecycle", ["pause", "cancel", "complete", "set_blocked"])
+def test_stale_task_never_runs_after_saved_lifecycle_change(home, lifecycle):
+    h = Harness(home)
+    if lifecycle == "set_blocked":
+        h.store.set_blocked(h.task.id, "action needed")
+    else:
+        getattr(h.store, lifecycle)(h.task.id)
+    expected = RunOutcome.SKIPPED_TERMINAL if lifecycle in ("cancel", "complete") else RunOutcome.SKIPPED_INACTIVE
+    assert h.loop.run_once(h.task, h.clock.now) is expected
+    assert h.github.fetch_calls == 0
+    assert h.sink.events == []
+
+
+@pytest.mark.parametrize("change", ["pause", "cancel", "scope"])
+@pytest.mark.parametrize("fetch_error", [None, "auth", "rate-limit"])
+def test_lifecycle_change_during_fetch_prevents_delivery_and_stale_write(home, change, fetch_error):
+    h = Harness(home)
+    h.github.add_check("ci", SUCCESS, sha="s1")
+
+    class ChangingFetcher:
+        def fetch(self, target):
+            if change == "scope":
+                h.store.update_scope(h.task.id, cadence_seconds=600)
+            else:
+                getattr(h.store, change)(h.task.id)
+            if fetch_error:
+                raise TYPICAL_ERRORS[fetch_error]
+            return h.github.snapshot()
+
+    h.loop = TaskLoop(h.store, ChangingFetcher(), h.sink, h.activity)
+    expected = {
+        "pause": RunOutcome.SKIPPED_INACTIVE,
+        "cancel": RunOutcome.SKIPPED_TERMINAL,
+        "scope": RunOutcome.SKIPPED_SCOPE_CHANGED,
+    }[change]
+    assert h.tick() is expected
+    assert h.sink.events == []
+    saved = h.store.get(h.task.id)
+    if change == "scope":
+        assert saved.cadence_seconds == 600 and saved.scope_version == 2
+    else:
+        assert saved.state is (TaskState.PAUSED if change == "pause" else TaskState.CANCELLED)
+
+
+def test_failure_occurrence_survives_restart(home):
+    h = Harness(home)
+    h.github.add_check("ci", FAILURE, sha="s1")
+    h.tick()
+    first_id = h.sink.events[0].occurrence
+    h.github.checks["s1"] = []
+    h.github.add_check("ci", None, sha="s1", status=QUEUED)
+    h.tick()
+    h.store.close()
+    h.store = TaskStore(path=home / "nanodot.db")
+    h.loop = TaskLoop(h.store, h.github, h.sink, h.activity)
+    h.github.checks["s1"] = []
+    h.github.add_check("ci", FAILURE, sha="s1")
+    h.tick()
+    assert h.sink.kinds() == [CHECKS_FAILED, CHECKS_FAILED]
+    assert h.sink.events[-1].occurrence != first_id
+
+
 def test_stale_update_cannot_undo_pause_or_scope_change(home):
     store = TaskStore()
     task = store.create(make_task())
@@ -216,6 +301,45 @@ def test_stale_update_cannot_undo_pause_or_scope_change(home):
     with pytest.raises(TaskError, match="scope changed"):
         store.update(task)
     assert store.get(task.id).cadence_seconds == 600
+
+
+def test_secret_target_is_rejected_on_create_update_and_execution(home):
+    from nanodot.core.redaction import Redactor
+    from nanodot.native.secrets_file import FileSecretStore
+    from nanodot.core.activity import ActivityLog
+    from fakes import FakeSink
+
+    secret = "ghp_target_secret999"
+    secrets = FileSecretStore()
+    secrets.set("github-token", secret)
+    store = TaskStore(redactor=Redactor(secrets))
+    target = PRTarget.parse(f"{secret}/repo#1")
+    with pytest.raises(TaskError, match="configured secret") as error:
+        store.create(Task(target=target, purpose="watch", next_check_at=0))
+    assert secret not in str(error.value)
+    task = store.create(make_task())
+    task.target = target
+    with pytest.raises(TaskError, match="configured secret"):
+        store.update(task)
+    assert secret.encode() not in (home / "nanodot.db").read_bytes()
+
+    # A newly configured secret can match an older stored target. Reads stay
+    # inspectable, but both scheduling and a direct executor must block it.
+    secrets.unset("github-token")
+    legacy = store.create(Task(target=target, purpose="legacy", next_check_at=0))
+    secrets.set("github-token", secret)
+    fetcher, sink = FakeGitHub(target), FakeSink()
+    loop = TaskLoop(store, fetcher, sink, ActivityLog())
+    assert loop.run_once(legacy, now=1000) is RunOutcome.BLOCKED
+    assert fetcher.fetch_calls == 0 and sink.events == []
+    assert secret not in store.get(legacy.id).blocker
+    assert store.cancel(legacy.id).state is TaskState.CANCELLED
+
+    secrets.unset("github-token")
+    legacy2 = store.create(Task(target=target, purpose="legacy 2", next_check_at=0))
+    secrets.set("github-token", secret)
+    assert legacy2.id not in [t.id for t in store.list_schedulable(1000)]
+    assert store.get(legacy2.id).state is TaskState.BLOCKED
 
 
 def test_empty_allowed_actions_cannot_authorize_a_read(home):
@@ -233,30 +357,4 @@ def test_failure_names_use_same_conclusions_as_evaluator(conclusion):
     _, events = step(task, github.snapshot(), now=1000)
     failed = next(event for event in events if event.kind == CHECKS_FAILED)
     assert "required-job" in failed.message
-
-
-def test_secret_target_rejected_on_create_update_and_scheduling(home):
-    from nanodot.core.redaction import Redactor
-    from nanodot.native.secrets_file import FileSecretStore
-
-    secret = "ghp_target_secret999"
-    secrets = FileSecretStore()
-    secrets.set("github-token", secret)
-    store = TaskStore(redactor=Redactor(secrets))
-    target = PRTarget.parse(f"{secret}/repo#1")
-    with pytest.raises(TaskError, match="configured secret") as error:
-        store.create(Task(target=target, purpose="watch", next_check_at=0))
-    assert secret not in str(error.value)
-    task = store.create(make_task())
-    task.target = target
-    with pytest.raises(TaskError, match="configured secret"):
-        store.update(task)
-    assert secret.encode() not in (home / "nanodot.db").read_bytes()
-    secrets.unset("github-token")
-    legacy = store.create(Task(target=target, purpose="legacy", next_check_at=0))
-    secrets.set("github-token", secret)
-    assert legacy.id not in [t.id for t in store.list_schedulable(1000)]
-    assert store.get(legacy.id).state is TaskState.BLOCKED
-    assert secret not in store.get(legacy.id).blocker
-    assert store.cancel(legacy.id).state is TaskState.CANCELLED
 
