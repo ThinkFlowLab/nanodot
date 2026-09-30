@@ -165,6 +165,70 @@ def test_proposals_expire_after_window(memory: MemoryStore) -> None:
     assert memory.get(item.id) is None
 
 
+@pytest.mark.parametrize("elapsed", [60, 61])
+def test_expired_proposal_cannot_be_confirmed_without_sweep(home: Path, elapsed: int) -> None:
+    clock = FakeClock()
+    memory = MemoryStore(clock=clock)
+    item = memory.propose("pending preference", expires_in=60)
+    clock.advance(elapsed)
+    with pytest.raises(ValueError, match="expired"):
+        memory.confirm(item.id)
+    assert memory.get(item.id) is None
+    assert memory.context_for_prompts() == []
+
+
+@pytest.mark.parametrize("read", ["get", "list"])
+def test_memory_reads_expire_proposals_without_sweep(home: Path, read: str) -> None:
+    clock = FakeClock()
+    activity = ActivityLog()
+    memory = MemoryStore(clock=clock, activity=activity)
+    expired = memory.propose("old proposal", expires_in=60)
+    active = memory.propose("fresh proposal", expires_in=120)
+    confirmed = memory.add_user("confirmed preference")
+    clock.advance(60)
+    if read == "get":
+        assert memory.get(expired.id) is None
+    else:
+        assert {item.id for item in memory.list()} == {active.id, confirmed.id}
+    assert memory.get(active.id) == active
+    assert memory.get(confirmed.id) == confirmed
+    tombstones = activity.query(task_id="memory", kinds=("memory-deleted",))
+    assert len(tombstones) == 1
+    assert expired.id in tombstones[0].message
+    assert "old proposal" not in tombstones[0].message
+
+
+def test_memory_startup_removes_expired_proposals(home: Path) -> None:
+    clock = FakeClock()
+    memory = MemoryStore(clock=clock)
+    expired = memory.propose("expired private preference", expires_in=60)
+    confirmed = memory.add_user("confirmed preference")
+    memory.close()
+    clock.advance(60)
+    memory = MemoryStore(clock=clock)
+    assert memory.get(expired.id) is None
+    assert memory.list() == [confirmed]
+    assert b"expired private preference" not in (home / "nanodot.db").read_bytes()
+
+
+def test_confirmed_proposal_survives_its_original_expiry(home: Path) -> None:
+    clock = FakeClock()
+    memory = MemoryStore(clock=clock)
+    proposal = memory.propose("keep this preference", expires_in=60)
+    clock.advance(59)
+    confirmed = memory.confirm(proposal.id)
+    clock.advance(2)
+    assert memory.get(proposal.id) == confirmed
+
+
+def test_confirmation_uses_the_supplied_time(home: Path) -> None:
+    clock = FakeClock()
+    memory = MemoryStore(clock=clock)
+    proposal = memory.propose("pending preference", expires_in=60)
+    with pytest.raises(ValueError, match="expired"):
+        memory.confirm(proposal.id, at=clock.time() + 60)
+
+
 # -- the loop runs with an empty memory store -------------------------------------------
 
 

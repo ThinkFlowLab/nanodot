@@ -11,6 +11,7 @@ The four UX questions from issue #1 become commands:
 from __future__ import annotations
 
 import argparse
+import getpass
 import os
 import signal
 import subprocess
@@ -21,6 +22,9 @@ from pathlib import Path
 
 from nanodot import __version__
 from nanodot.paths import data_home
+from nanodot.core.tasks import (
+    DEFAULT_NOTIFICATION_CONDITIONS, DEFAULT_STOP_CONDITIONS,
+)
 
 DEFAULT_CADENCE = 300
 
@@ -40,7 +44,8 @@ def build_parser() -> argparse.ArgumentParser:
     config_sub = config.add_subparsers(dest="config_command", required=True)
     config_set = config_sub.add_parser("set", help="set a value")
     config_set.add_argument("name")
-    config_set.add_argument("value")
+    config_set.add_argument("value", nargs="?", help="value; use - for stdin, "
+                            "or omit a secret value for a hidden prompt")
     config_unset = config_sub.add_parser("unset", help="remove a value")
     config_unset.add_argument("name")
     config_sub.add_parser("list", help="list configured values (secrets masked)")
@@ -55,9 +60,10 @@ def build_parser() -> argparse.ArgumentParser:
                      "configured model parses it into target + purpose")
     add.add_argument("--cadence", type=int, default=DEFAULT_CADENCE,
                      help="seconds between checks (default 300)")
-    add.add_argument("--notify", default="check failures and terminal outcomes")
-    add.add_argument("--stop", default="required checks pass on the current head "
-                                       "SHA, or the PR merges or closes")
+    add.add_argument("--notify", default=DEFAULT_NOTIFICATION_CONDITIONS,
+                     help="fixed MVP policy only; custom conditions are rejected")
+    add.add_argument("--stop", default=DEFAULT_STOP_CONDITIONS,
+                     help="fixed MVP policy only; custom conditions are rejected")
     add.add_argument("--yes", action="store_true", help="skip confirmation")
     watch_sub.add_parser("list", help="status, latest result, next check, blockers")
     show = watch_sub.add_parser("show", help="full saved scope of one task")
@@ -153,17 +159,35 @@ def _run_config(args: argparse.Namespace) -> int:
     config = Config()
     store = FileSecretStore()
     if args.config_command == "set":
+        value = args.value
+        if value == "-":
+            value = sys.stdin.readline().rstrip("\r\n")
+        elif value is None and is_secret_name(args.name):
+            if not sys.stdin.isatty():
+                print("error: use - to read a secret from stdin", file=sys.stderr)
+                return 1
+            value = getpass.getpass(f"{args.name}: ")
+        if value is None or (is_secret_name(args.name) and not value):
+            print("error: a nonempty value is required", file=sys.stderr)
+            return 1
         if is_secret_name(args.name):
-            store.set(args.name, args.value)
+            store.set(args.name, value)
+            config.unset(args.name)  # remove a legacy plaintext copy after safe save
         else:
-            config.set(args.name, args.value)
+            try:
+                config.set(args.name, value)
+            except ValueError as error:
+                print(f"error: {error}", file=sys.stderr)
+                return 1
     elif args.config_command == "unset":
         if is_secret_name(args.name):
             store.unset(args.name)
+            config.unset(args.name)
         else:
             config.unset(args.name)
     else:  # list
-        rows = [(key, str(config.get(key))) for key in config.keys()]
+        rows = [(key, MASK if is_secret_name(key) else str(config.get(key)))
+                for key in config.keys() if key not in store.names()]
         rows += [(name, MASK) for name in store.names()]
         for key, value in sorted(rows):
             print(f"{key}={value}")
@@ -177,16 +201,20 @@ def _run_watch(args: argparse.Namespace) -> int:
     from nanodot.core.tasks import PRTarget, Task, TaskError
     from nanodot.native.secrets_file import FileSecretStore
 
-    secrets, store, activity, sink, _, loop = _wiring()
-    from nanodot.core.memory import MemoryStore
+    from nanodot.core.activity import ActivityLog
+    from nanodot.core.redaction import Redactor
+    from nanodot.core.tasks import TaskStore
 
-    memory = MemoryStore(activity=activity)
+    secrets = FileSecretStore()
+    redactor = Redactor(secrets)
+    store = TaskStore(redactor=redactor)
+    activity = ActivityLog(redactor=redactor)
 
     if args.watch_command == "add":
         if not secrets.get("github-token"):
             print(
                 "error: no GitHub token configured — run: "
-                "nanodot config set github-token <read-only PAT>",
+                "nanodot config set github-token (hidden prompt)",
                 file=sys.stderr,
             )
             return 1
@@ -213,19 +241,28 @@ def _run_watch(args: argparse.Namespace) -> int:
             print("error: a target is required: owner/repo#number",
                   file=sys.stderr)
             return 1
+        if redactor.contains_secret(target_text):
+            print("error: a PR target must not contain a configured secret", file=sys.stderr)
+            return 1
         try:
             target = PRTarget.parse(target_text)
         except TaskError as error:
-            print(f"error: {error}", file=sys.stderr)
+            print(f"error: {redactor.scrub(str(error))}", file=sys.stderr)
             return 1
-        task = Task(
-            target=target,
-            purpose=purpose,
-            cadence_seconds=args.cadence,
-            notification_conditions=args.notify,
-            stop_conditions=args.stop,
-            next_check_at=time.time(),
-        )
+        try:
+            task = Task(
+                target=target,
+                purpose=redactor.scrub(purpose),
+                cadence_seconds=args.cadence,
+                notification_conditions=args.notify,
+                stop_conditions=args.stop,
+                next_check_at=time.time(),
+            )
+            task.validate()
+        except TaskError as error:
+            print(f"error: {redactor.scrub(str(error))}", file=sys.stderr)
+            return 1
+        memory = _configured_memory(activity=activity)
         print("About to create a watch:")
         print(f"  target:                 {task.target}")
         print(f"  purpose:                {task.purpose}")
@@ -296,10 +333,19 @@ def _run_watch(args: argparse.Namespace) -> int:
     return 0
 
 
-def _run_memory(args: argparse.Namespace) -> int:
+def _configured_memory(activity=None):
+    from nanodot.core.activity import ActivityLog
     from nanodot.core.memory import MemoryStore
+    from nanodot.core.redaction import Redactor
+    from nanodot.native.secrets_file import FileSecretStore
 
-    memory = MemoryStore()
+    redactor = Redactor(FileSecretStore())
+    activity = activity if activity is not None else ActivityLog(redactor=redactor)
+    return MemoryStore(redactor=redactor, activity=activity)
+
+
+def _run_memory(args: argparse.Namespace) -> int:
+    memory = _configured_memory()
     try:
         if args.memory_command == "add":
             item = memory.add_user(args.content, kind=args.kind)
@@ -344,11 +390,15 @@ def _print_memory_item(item) -> None:
     )
 
 
+
+
 # -- activity / inbox -----------------------------------------------------------
 
 
 def _run_activity(args: argparse.Namespace) -> int:
-    _, store, activity, _, _, _ = _wiring()
+    from nanodot.core.activity import ActivityLog
+
+    activity = ActivityLog()
     entries = activity.query(task_id=getattr(args, "task_id", None), limit=50)
     if not entries:
         print("no activity yet")
@@ -382,78 +432,102 @@ def _run_runner(args: argparse.Namespace) -> int:
     import threading
 
     from nanodot.native.daemon import RunnerDaemon
+    from nanodot.native.runner_control import RunnerControlError, RunnerLease
 
-    _, store, _, _, _, loop = _wiring()
-    daemon = RunnerDaemon(loop, store)
-    if args.once:
-        attempted = daemon.tick()
-        blockers = [t for t in store.list() if t.blocker]
-        if blockers:
-            for task in blockers:
-                print(f"blocked: {task.id} ({task.target}): {task.blocker}",
-                      file=sys.stderr)
-            return 1
-        print(f"ran {attempted} task(s)")
-        return 0
     stop = threading.Event()
 
     def _sigint(_signum, _frame) -> None:
         stop.set()
 
-    signal.signal(signal.SIGINT, _sigint)
-    signal.signal(signal.SIGTERM, _sigint)
-    print("nanodot runner started — Ctrl-C to stop", flush=True)
-    daemon.serve(stop)
-    print("nanodot runner stopped")
-    return 0
+    try:
+        _, store, _, _, _, loop = _wiring()
+        daemon = RunnerDaemon(loop, store)
+        with RunnerLease(_pidfile(), stop):
+            if args.once:
+                attempted = daemon.tick()
+                blockers = [t for t in store.list() if t.blocker]
+                if blockers:
+                    for task in blockers:
+                        print(f"blocked: {task.id} ({task.target}): {task.blocker}",
+                              file=sys.stderr)
+                    return 1
+                print(f"ran {attempted} task(s)")
+                return 0
+            signal.signal(signal.SIGINT, _sigint)
+            signal.signal(signal.SIGTERM, _sigint)
+            print("nanodot runner started — Ctrl-C to stop", flush=True)
+            daemon.serve(stop)
+            print("nanodot runner stopped")
+            return 0
+    except (RunnerControlError, OSError) as error:
+        print(f"error: {error}", file=sys.stderr)
+        return 1
 
 
 def _run_start(_: argparse.Namespace) -> int:
-    if _runner_alive():
-        print("runner is already running")
-        return 0
-    log = open(data_home() / "runner.log", "ab")
-    process = subprocess.Popen(
-        [sys.executable, "-m", "nanodot.cli", "runner"],
-        stdout=log,
-        stderr=log,
-        start_new_session=True,
+    from nanodot.native.runner_control import (
+        RunnerControlError, running_pid, startup_lock,
     )
-    _pidfile().write_text(str(process.pid))
-    print(f"runner started (pid {process.pid}) — logs: {data_home() / 'runner.log'}")
-    return 0
+
+    try:
+        with startup_lock(_pidfile()):
+            if running_pid(_pidfile()) is not None:
+                print("runner is already running")
+                return 0
+            with open(data_home() / "runner.log", "ab") as log:
+                process = subprocess.Popen(
+                    [sys.executable, "-m", "nanodot.cli", "runner"],
+                    stdout=log, stderr=log, start_new_session=True,
+                )
+            deadline = time.monotonic() + 5.0
+            while time.monotonic() < deadline:
+                try:
+                    pid = running_pid(_pidfile())
+                except RunnerControlError:
+                    pid = None  # the child may be publishing its lease
+                if pid is not None:
+                    print(f"runner started (pid {pid}) — logs: {data_home() / 'runner.log'}")
+                    return 0
+                if process.poll() is not None:
+                    raise RunnerControlError(
+                        f"runner exited during startup; see {data_home() / 'runner.log'}"
+                    )
+                time.sleep(0.05)
+            raise RunnerControlError(
+                "runner startup was not confirmed within 5s; check status before retrying"
+            )
+    except (RunnerControlError, OSError) as error:
+        print(f"error: {error}", file=sys.stderr)
+        return 1
 
 
 def _runner_alive() -> bool:
-    pid_file = _pidfile()
-    if not pid_file.exists():
-        return False
-    try:
-        pid = int(pid_file.read_text().strip())
-        os.kill(pid, 0)
-        return True
-    except (ValueError, ProcessLookupError, PermissionError):
-        return False
+    from nanodot.native.runner_control import running_pid
+
+    return running_pid(_pidfile()) is not None
 
 
 def _run_stop(_: argparse.Namespace) -> int:
-    pid_file = _pidfile()
-    if not pid_file.exists():
-        print("runner is not running")
-        return 0
-    pid = int(pid_file.read_text().strip())
+    from nanodot.native.runner_control import RunnerControlError, stop_runner
+
     try:
-        os.kill(pid, signal.SIGTERM)
-    except ProcessLookupError:
-        pass
-    pid_file.unlink()
-    print("runner stopped")
+        stopped = stop_runner(_pidfile())
+    except (RunnerControlError, OSError) as error:
+        print(f"error: {error}", file=sys.stderr)
+        return 1
+    print("runner stopped" if stopped else "runner is not running")
     return 0
 
 
 def _run_status(_: argparse.Namespace) -> int:
-    if _runner_alive():
-        pid = _pidfile().read_text().strip()
+    from nanodot.native.runner_control import RunnerControlError, running_pid
+
+    try:
+        pid = running_pid(_pidfile())
+    except (RunnerControlError, OSError) as error:
+        print(f"error: {error}", file=sys.stderr)
+        return 1
+    if pid is not None:
         print(f"runner is running (pid {pid})")
         return 0
     print("runner is not running")

@@ -14,6 +14,7 @@ from nanodot.ports.github import (
     CheckRun,
     PRNotFoundError,
     RetryableError,
+    RequiredCheck,
     Snapshot,
     SnapshotFetcher,
 )
@@ -64,6 +65,11 @@ class FakeGitHub(SnapshotFetcher):
                 if sha != self.head_sha
                 for run in runs
             ),
+            required_checks=tuple(
+                RequiredCheck(name=run.name)
+                for run in self.checks.get(self.head_sha, ())
+            ),
+            checks_complete=True,
             fetched_at=time.time(),
             url=f"https://github.com/{self.target.owner}/{self.target.repo}"
             f"/pull/{self.target.number}",

@@ -23,6 +23,30 @@ from nanodot.paths import database_path
 
 READ_ONLY_ACTIONS = frozenset({"read"})
 
+# The MVP implements one fixed watch policy, not a natural-language rule
+# interpreter. Keep the two previously shipped default spellings as explicit
+# aliases so existing default watches remain usable without rewriting scope.
+DEFAULT_NOTIFICATION_CONDITIONS = (
+    "notify on check failures, new commits, access blockers, and terminal outcomes"
+)
+DEFAULT_STOP_CONDITIONS = (
+    "stop when required checks pass on the current head SHA, or the PR "
+    "is merged or closed"
+)
+SUPPORTED_NOTIFICATION_CONDITIONS = frozenset(
+    {
+        DEFAULT_NOTIFICATION_CONDITIONS,
+        "notify on check failures and terminal outcomes",
+        "check failures and terminal outcomes",
+    }
+)
+SUPPORTED_STOP_CONDITIONS = frozenset(
+    {
+        DEFAULT_STOP_CONDITIONS,
+        "required checks pass on the current head SHA, or the PR merges or closes",
+    }
+)
+
 
 class TaskError(ValueError):
     """Invalid task definition or transition."""
@@ -66,11 +90,8 @@ class Task:
     purpose: str
     cadence_seconds: int = 300
     allowed_actions: tuple[str, ...] = ("read",)
-    notification_conditions: str = "notify on check failures and terminal outcomes"
-    stop_conditions: str = (
-        "stop when required checks pass on the current head SHA, or the PR "
-        "is merged or closed"
-    )
+    notification_conditions: str = DEFAULT_NOTIFICATION_CONDITIONS
+    stop_conditions: str = DEFAULT_STOP_CONDITIONS
     state: TaskState = TaskState.ACTIVE
     blocker: str | None = None
     scope_version: int = 1
@@ -89,6 +110,18 @@ class Task:
         if extra:
             raise TaskError(
                 f"actions not allowed in the read-only MVP: {sorted(extra)}"
+            )
+        if "read" not in self.allowed_actions:
+            raise TaskError("a PR watch requires the read action")
+        if self.notification_conditions not in SUPPORTED_NOTIFICATION_CONDITIONS:
+            raise TaskError(
+                "unsupported notification conditions; the MVP only supports: "
+                + DEFAULT_NOTIFICATION_CONDITIONS
+            )
+        if self.stop_conditions not in SUPPORTED_STOP_CONDITIONS:
+            raise TaskError(
+                "unsupported stop conditions; the MVP only supports: "
+                + DEFAULT_STOP_CONDITIONS
             )
 
 
@@ -138,6 +171,9 @@ class TaskStore:
         return self._redactor.scrub(text)
 
     def _row_to_task(self, row: sqlite3.Row) -> Task:
+        # Preserve unsupported legacy scope for inspection and cancellation.
+        # Loading is not authorization to execute: every runnable boundary
+        # validates, and the scheduler quarantines invalid active tasks.
         return Task(
             id=row["id"],
             target=PRTarget.parse(row["target"]),
@@ -175,14 +211,22 @@ class TaskStore:
 
     # -- CRUD ------------------------------------------------------------
 
-    def create(self, task: Task) -> Task:
+    def validate(self, task: Task) -> None:
+        """Validate scope and identifiers before persistence or execution."""
         task.validate()
-        with self._lock:
-            self._conn.execute(
-                "INSERT INTO tasks VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-                self._task_to_values(task),
-            )
-            self._conn.commit()
+        if self._redactor.contains_secret(str(task.target)):
+            raise TaskError("PR target contains a configured secret; use a non-secret identifier")
+
+    def create(self, task: Task) -> Task:
+        self.validate(task)
+        try:
+            with self._lock, self._conn:
+                self._conn.execute(
+                    "INSERT INTO tasks VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    self._task_to_values(task),
+                )
+        except sqlite3.IntegrityError as error:
+            raise TaskError(f"task {task.id} already exists or has invalid fields") from error
         return task
 
     def get(self, task_id: str) -> Task | None:
@@ -208,12 +252,39 @@ class TaskStore:
                 "ORDER BY next_check_at",
                 (TaskState.ACTIVE.value, now),
             ).fetchall()
-        return [self._row_to_task(row) for row in rows]
+        tasks = []
+        for row in rows:
+            task = self._row_to_task(row)
+            try:
+                self.validate(task)
+            except TaskError as error:
+                self.set_blocked(task.id, f"invalid saved task scope: {error}")
+                continue
+            tasks.append(task)
+        return tasks
 
     def update(self, task: Task) -> Task:
-        task.validate()
+        self.validate(task)
         task.updated_at = self._time.time()
-        with self._lock:
+        with self._lock, self._conn:
+            self._conn.execute("BEGIN IMMEDIATE")
+            current = self._require(task.id)
+            self._check_transition(current, task.state)
+            if current.state is not TaskState.ACTIVE and task.state is not current.state:
+                raise TaskError("task is no longer active; use an explicit lifecycle operation")
+            if task.scope_version < current.scope_version:
+                raise TaskError("task scope changed; reload it before updating")
+            scope_fields = (
+                "target", "purpose", "cadence_seconds", "allowed_actions",
+                "notification_conditions", "stop_conditions",
+            )
+            scope_changed = any(
+                getattr(task, name) != getattr(current, name) for name in scope_fields
+            ) or task.scope_version > current.scope_version
+            if scope_changed:
+                task.scope_version = current.scope_version + 1
+            else:
+                task.scope_version = current.scope_version
             self._conn.execute(
                 "UPDATE tasks SET target=?, purpose=?, cadence_seconds=?, "
                 "allowed_actions=?, notification_conditions=?, stop_conditions=?, "
@@ -221,23 +292,52 @@ class TaskStore:
                 "next_check_at=?, watch_state=? WHERE id=?",
                 self._task_to_values(task)[1:] + (task.id,),
             )
-            self._conn.commit()
         return task
 
     # -- lifecycle ---------------------------------------------------------
 
-    def _set_state(self, task: Task, state: TaskState, blocker: str | None) -> Task:
-        task.state = state
-        task.blocker = blocker
-        if state.terminal:
-            task.next_check_at = None
-        return self.update(task)
+    def _set_state(
+        self, task: Task, state: TaskState, blocker: str | None,
+        now: float | None = None,
+    ) -> Task:
+        # State-only transitions do not rewrite scope. This deliberately lets
+        # the user pause/cancel an unsupported legacy watch without approving
+        # a replacement scope merely to make it stop.
+        with self._lock, self._conn:
+            self._conn.execute("BEGIN IMMEDIATE")
+            task = self._require(task.id)
+            self._check_transition(task, state)
+            if state is TaskState.ACTIVE:
+                self.validate(task)
+                if task.state is not TaskState.ACTIVE or task.next_check_at is None:
+                    task.next_check_at = now if now is not None else self._time.time()
+            else:
+                task.next_check_at = None
+            task.state = state
+            task.blocker = blocker
+            task.updated_at = self._time.time()
+            self._conn.execute(
+                "UPDATE tasks SET state=?, blocker=?, next_check_at=?, updated_at=? "
+                "WHERE id=?",
+                (
+                    state.value, self._scrub(blocker) if blocker else None,
+                    task.next_check_at, task.updated_at, task.id,
+                ),
+            )
+        return task
+
+    @staticmethod
+    def _check_transition(task: Task, state: TaskState) -> None:
+        if task.state.terminal and state is not task.state:
+            raise TaskError(f"cannot change a {task.state.value} task; create a new watch")
+        if task.watch_state.get("terminal") and not state.terminal:
+            raise TaskError("cannot reactivate a terminal watch; create a new watch")
 
     def pause(self, task_id: str) -> Task:
         return self._set_state(self._require(task_id), TaskState.PAUSED, None)
 
-    def resume(self, task_id: str) -> Task:
-        return self._set_state(self._require(task_id), TaskState.ACTIVE, None)
+    def resume(self, task_id: str, now: float | None = None) -> Task:
+        return self._set_state(self._require(task_id), TaskState.ACTIVE, None, now=now)
 
     def cancel(self, task_id: str) -> Task:
         return self._set_state(self._require(task_id), TaskState.CANCELLED, None)
