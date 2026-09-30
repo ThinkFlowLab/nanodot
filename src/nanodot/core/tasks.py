@@ -122,6 +122,7 @@ class TaskStore:
         clock: type(time) | None = None,
     ) -> None:
         self._path = path or database_path()
+        self._path.parent.mkdir(parents=True, exist_ok=True)
         self._redactor = redactor or Redactor(_NullSecrets())
         self._time = clock or time
         self._lock = threading.RLock()
@@ -248,6 +249,18 @@ class TaskStore:
         return self._set_state(
             self._require(task_id), TaskState.BLOCKED, self._scrub(reason)
         )
+
+    def flag(self, task_id: str, reason: str) -> Task:
+        """Set a visible blocker while the task stays active and retrying
+        (e.g. prolonged fetch failures — visible, not stopped)."""
+        task = self._require(task_id)
+        task.blocker = self._scrub(reason)
+        return self.update(task)
+
+    def clear_flag(self, task_id: str) -> Task:
+        task = self._require(task_id)
+        task.blocker = None
+        return self.update(task)
 
     def update_scope(
         self,

@@ -74,6 +74,19 @@ class FakeGitHub(SnapshotFetcher):
         return self.snapshot()
 
 
+class FakeSink:
+    """Records every notified event for assertions."""
+
+    def __init__(self) -> None:
+        self.events: list = []
+
+    def notify(self, event) -> None:
+        self.events.append(event)
+
+    def kinds(self) -> list[str]:
+        return [event.kind for event in self.events]
+
+
 class FakeClock:
     """Deterministic clock for cadence/backoff/expiry tests."""
 
