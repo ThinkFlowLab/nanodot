@@ -270,6 +270,24 @@ def test_lifecycle_change_during_fetch_prevents_delivery_and_stale_write(home, c
         assert saved.state is (TaskState.PAUSED if change == "pause" else TaskState.CANCELLED)
 
 
+def test_terminal_observation_failure_does_not_undo_completion(home, caplog):
+    h = Harness(home)
+    h.github.add_check("ci", SUCCESS, sha="s1")
+
+    class FailingMemory:
+        def add_observation(self, **kwargs):
+            assert h.store.get(h.task.id).state is TaskState.COMPLETED
+            raise RuntimeError("private memory contents")
+
+    h.loop = TaskLoop(h.store, h.github, h.sink, h.activity, memory=FailingMemory())
+    assert h.tick() is RunOutcome.TERMINAL
+    saved = h.store.get(h.task.id)
+    assert saved.state is TaskState.COMPLETED and saved.next_check_at is None
+    assert h.store.list_schedulable(h.clock.now + 10000) == []
+    assert h.tick() is RunOutcome.SKIPPED_TERMINAL
+    assert h.sink.kinds() == [CHECKS_PASSED]
+    assert "observation could not be saved" in caplog.text
+    assert "private memory contents" not in caplog.text
 
 
 def test_failure_occurrence_survives_restart(home):

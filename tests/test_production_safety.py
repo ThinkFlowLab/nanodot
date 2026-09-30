@@ -9,6 +9,7 @@ import pytest
 from nanodot.cli import main
 from nanodot.core.activity import ActivityLog
 from nanodot.core.config import Config
+from nanodot.core.memory import MemoryStore
 from nanodot.core.redaction import Redactor
 from nanodot.core.tasks import TaskStore
 from nanodot.native.inference_api import APIInferenceProvider, configured_provider
@@ -69,6 +70,27 @@ def test_real_cli_intent_scrubs_input_output_and_retained_task(home, monkeypatch
     assert SECRET.encode() not in (home / "nanodot.db").read_bytes()
 
 
+def test_real_memory_commands_redact_and_write_contentless_tombstone(home, capsys):
+    FileSecretStore().set("github-token", SECRET)
+    assert main(["memory", "add", f"deploy {SECRET}"]) == 0
+    memory = MemoryStore()
+    item = memory.list()[0]
+    assert item.content == "deploy ***"
+    assert main(["memory", "edit", item.id, "--content", f"new {SECRET}"]) == 0
+    assert main(["memory", "propose", f"proposal {SECRET}"]) == 0
+    proposed = memory.list(status="proposed")[0]
+    assert main(["memory", "confirm", proposed.id]) == 0
+    assert main(["memory", "list"]) == 0
+    assert SECRET not in capsys.readouterr().out
+    assert SECRET.encode() not in (home / "nanodot.db").read_bytes()
+    assert main(["memory", "rm", item.id]) == 0
+    assert memory.get(item.id) is None
+    tombstones = ActivityLog().query(kinds=("memory-deleted",))
+    assert len(tombstones) == 1
+    assert item.id in tombstones[0].message
+    assert "deploy" not in tombstones[0].message
+    assert "new " not in tombstones[0].message
+    assert SECRET not in tombstones[0].message
 
 
 def test_nested_redaction_preserves_input_and_scrubs_longest_secret(home):

@@ -7,12 +7,14 @@ scheduler/executor port (see adapter-seam.md) drives `run_once`.
 
 from __future__ import annotations
 
+import logging
 import threading
 from dataclasses import replace
 from enum import Enum
 
 from nanodot.core import statemachine
 from nanodot.core.activity import ActivityLog
+from nanodot.core.memory import MemoryStore
 from nanodot.core.statemachine import WatchEvent
 from nanodot.core.tasks import Task, TaskError, TaskState, TaskStore
 from nanodot.ports.github import (
@@ -119,6 +121,7 @@ class TaskLoop:
         sink: NotificationSink,
         activity: ActivityLog,
         provider: InferenceProvider | None = None,
+        memory: MemoryStore | None = None,
         summary_budget_seconds: float = SUMMARY_BUDGET_SECONDS,
     ) -> None:
         self._store = store
@@ -126,6 +129,7 @@ class TaskLoop:
         self._sink = sink
         self._activity = activity
         self._provider = provider
+        self._memory = memory
         self._summaries = _SummaryBudget(summary_budget_seconds)
         self._locks: dict[str, threading.Lock] = {}
         self._locks_guard = threading.Lock()
@@ -233,9 +237,32 @@ class TaskLoop:
             return skipped
         terminal = any(event.terminal for event in events)
         if terminal:
+            terminal_event = next(e for e in events if e.terminal)
+            # Persist completion before optional memory work. A failed
+            # observation cannot leave an ACTIVE task with terminal state.
             task.state = TaskState.COMPLETED
             task.next_check_at = None
             self._store.update(task)
+            if self._memory is not None:
+                # Write path 2: evidenced terminal outcome, auto-recorded
+                # as an observation with provenance to the evidence.
+                try:
+                    self._memory.add_observation(
+                        content=f"{task.target}: {terminal_event.message}",
+                        task_id=task.id,
+                        evidence_ref=(
+                            f"{terminal_event.evidence.get('url', '')}@"
+                            f"{terminal_event.evidence.get('head_sha', '')}"
+                        ),
+                        at=now,
+                    )
+                except Exception:
+                    # Do not log provider/store exception text; it may include
+                    # private contents. The durable terminal result is intact.
+                    logging.getLogger(__name__).warning(
+                        "task %s completed, but its observation could not be saved",
+                        task.id,
+                    )
             return RunOutcome.TERMINAL
 
         task.next_check_at = now + task.cadence_seconds
