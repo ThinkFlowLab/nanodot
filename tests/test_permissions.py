@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import ast
 import io
+import json
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from unittest import mock
 
@@ -88,7 +90,7 @@ def test_github_client_issues_gets_only() -> None:
         )
 
     with mock.patch(
-        "nanodot.native.github_client.urllib.request.urlopen", fake_urlopen
+        "nanodot.native.github_client.authenticated_urlopen", fake_urlopen
     ):
         fetcher = GitHubSnapshotFetcher(token="t")
         with pytest.raises(Exception):
@@ -116,8 +118,24 @@ def test_gate_blocks_writes_in_readonly_mode(home: Path) -> None:
 
 
 def test_unknown_mode_falls_back_to_readonly(home: Path) -> None:
-    Config().set("mode", "yolo-anything-goes")
+    home.mkdir(parents=True, exist_ok=True)
+    (home / "config.json").write_text(json.dumps({"mode": "yolo-anything-goes"}))
     assert PermissionCenter().mode() is Mode.READONLY
+
+
+@pytest.mark.parametrize("mode", ["gated", "auto"])
+def test_dormant_modes_are_rejected_and_never_enable_writes(home: Path, mode: str) -> None:
+    with pytest.raises(ValueError, match="only readonly"):
+        Config().set("mode", mode)
+    # Pre-existing or manually edited configuration cannot bypass the gate.
+    home.mkdir(parents=True, exist_ok=True)
+    (home / "config.json").write_text(json.dumps({"mode": mode}))
+    center = PermissionCenter()
+    with pytest.raises(ValueError, match="not supported"):
+        center.mode()
+    with pytest.raises(WriteForbidden, match="only readonly"):
+        center.assert_allowed("merge")
+    center.assert_allowed("read")
 
 
 # -- scoped grants -----------------------------------------------------------------
@@ -148,6 +166,8 @@ def test_expired_grant_does_not_permit(home: Path) -> None:
     _approved_grant(center)
     clock.advance(24 * 3600 + 1)  # past the request TTL
     assert not center.permits("rerun", "owner/repo#1", "failed-checks")
+    assert center.grants(active_only=True) == []
+    assert len(center.grants()) == 1  # history remains inspectable
 
 
 def test_revoked_grant_does_not_permit(home: Path) -> None:
@@ -175,6 +195,56 @@ def test_unanswered_request_expires_and_grants_nothing(home: Path) -> None:
         center.approve(req.id)
 
 
+@pytest.mark.parametrize("elapsed", [60, 61])
+def test_approval_checks_expiry_without_a_sweep(home: Path, elapsed: int) -> None:
+    clock = FakeClock()
+    center = PermissionCenter(clock=clock)
+    req = center.request("comment", "o/r#1", "once", "t1", ttl=60)
+    clock.advance(elapsed)
+    with pytest.raises(ValueError, match="expired"):
+        center.approve(req.id)
+    assert center.grants() == []
+    assert center.request_history()[0].state == "expired"
+
+
+def test_pending_and_history_enforce_request_ttl(home: Path) -> None:
+    clock = FakeClock()
+    center = PermissionCenter(clock=clock)
+    expired = center.request("comment", "o/r#1", "once", "t1", ttl=60)
+    active = center.request("comment", "o/r#2", "once", "t2", ttl=120)
+    clock.advance(60)
+    assert center.pending() == [active]
+    states = {req.id: req.state for req in center.request_history()}
+    assert states == {expired.id: "expired", active.id: "pending"}
+
+
+def test_approval_cannot_create_duplicate_grants(home: Path) -> None:
+    center = PermissionCenter(clock=FakeClock())
+    req = center.request("comment", "o/r#1", "once", "t1")
+    center.approve(req.id)
+    with pytest.raises(ValueError, match="already approved"):
+        center.approve(req.id)
+    assert len(center.grants()) == 1
+
+
+def test_concurrent_approvals_create_only_one_grant(home: Path) -> None:
+    first = PermissionCenter(clock=FakeClock())
+    second = PermissionCenter(clock=FakeClock())
+    req = first.request("comment", "o/r#1", "once", "t1")
+
+    def approve(center):
+        try:
+            center.approve(req.id)
+            return "approved"
+        except ValueError:
+            return "already answered"
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        results = list(executor.map(approve, (first, second)))
+    assert sorted(results) == ["already answered", "approved"]
+    assert len(first.grants()) == 1
+
+
 def test_denials_are_recorded_not_reaskable(home: Path) -> None:
     center = PermissionCenter(clock=FakeClock())
     req = center.request("comment", "o/r#1", "once", "t1")
@@ -200,21 +270,25 @@ def test_task_scope_change_invalidates_its_grants(home: Path) -> None:
     assert center.permits("comment", "o/r#2", "x")
 
 
-def test_task_store_scope_bump_is_the_hook(home: Path) -> None:
+def test_task_store_scope_change_revokes_grants_and_pending_requests(home: Path) -> None:
     from nanodot.core.tasks import PRTarget, Task
 
     store = TaskStore()
     task = store.create(Task(target=PRTarget.parse("o/r#1"), purpose="p"))
     center = PermissionCenter(clock=FakeClock())
     _approved_grant(center, task_id=task.id)
+    pending = center.request("comment", "o/r#1", "once", task.id)
+    other_pending = center.request("comment", "o/r#2", "once", "other-task")
 
     before = store.get(task.id).scope_version
-    store.update_scope(task.id, stop_conditions="stop on merge only")
+    store.update_scope(task.id, cadence_seconds=600)
     after = store.get(task.id).scope_version
     assert after == before + 1
-    # The wiring contract: callers revoke on version change.
-    assert center.on_scope_change(task.id) == 1
     assert not center.permits("rerun", "owner/repo#1", "failed-checks")
+    assert center.grants()[0].revoked_at is not None
+    with pytest.raises(ValueError, match="expired"):
+        center.approve(pending.id)
+    assert center.pending() == [other_pending]
 
 
 # -- CLI surface ------------------------------------------------------------------------

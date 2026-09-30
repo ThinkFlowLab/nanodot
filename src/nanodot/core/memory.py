@@ -32,7 +32,7 @@ import sqlite3
 import threading
 import time
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 from nanodot.core.activity import ActivityLog
@@ -81,17 +81,23 @@ class MemoryStore:
         path: Path | None = None,
         redactor: Redactor | None = None,
         activity: ActivityLog | None = None,
+        clock=time,
     ) -> None:
         self._path = path or database_path()
         self._path.parent.mkdir(parents=True, exist_ok=True)
         self._redactor = redactor or Redactor(_NullSecrets())
         self._activity = activity
+        self._clock = clock
         self._lock = threading.RLock()
         self._conn = sqlite3.connect(self._path, check_same_thread=False)
         self._conn.row_factory = sqlite3.Row
         with self._lock:
+            # Explicitly remove deleted proposal/user content from freed
+            # database pages rather than relying on SQLite build defaults.
+            self._conn.execute("PRAGMA secure_delete=ON")
             self._conn.executescript(_SCHEMA)
             self._conn.commit()
+        self.sweep_expired()
 
     # -- write paths --------------------------------------------------------
 
@@ -135,7 +141,7 @@ class MemoryStore:
     ) -> MemoryItem:
         """Write path 3: a proposal (e.g. from a model). Proposed only —
         confirmation is a separate, user-driven act."""
-        now = at if at is not None else time.time()
+        now = at if at is not None else self._clock.time()
         return self._insert(
             kind=kind,
             content=content,
@@ -146,16 +152,30 @@ class MemoryStore:
         )
 
     def confirm(self, item_id: str, at: float | None = None) -> MemoryItem:
-        item = self._require(item_id)
-        if item.status != STATUS_PROPOSED:
-            raise ValueError(f"item {item_id} is not a proposal")
         with self._lock:
-            self._conn.execute(
-                "UPDATE memory SET status=?, expires_at=NULL WHERE id=?",
-                (STATUS_CONFIRMED, item_id),
-            )
-            self._conn.commit()
-        return self._require(item_id)
+            with self._conn:
+                self._conn.execute("BEGIN IMMEDIATE")
+                now = at if at is not None else self._clock.time()
+                row = self._conn.execute(
+                    "SELECT * FROM memory WHERE id=?", (item_id,)
+                ).fetchone()
+                if row is None:
+                    raise ValueError(f"no such memory item {item_id}")
+                item = self._row_to_item(row)
+                if item.status != STATUS_PROPOSED:
+                    raise ValueError(f"item {item_id} is not a proposal")
+                expired = item.expires_at is not None and item.expires_at <= now
+                if expired:
+                    self._conn.execute("DELETE FROM memory WHERE id=?", (item_id,))
+                else:
+                    self._conn.execute(
+                        "UPDATE memory SET status=?, expires_at=NULL WHERE id=?",
+                        (STATUS_CONFIRMED, item_id),
+                    )
+        if expired:
+            self._tombstone(item_id)
+            raise ValueError(f"proposal {item_id} expired; propose it again to confirm")
+        return replace(item, status=STATUS_CONFIRMED, expires_at=None)
 
     def edit(self, item_id: str, content: str) -> MemoryItem:
         self._require(item_id)
@@ -170,29 +190,38 @@ class MemoryStore:
     def remove(self, item_id: str) -> None:
         """Deletion: content gone from the store (and thus from every
         future read); activity keeps a contentless tombstone."""
-        item = self._require(item_id)
+        self._require(item_id)
         with self._lock:
             self._conn.execute("DELETE FROM memory WHERE id=?", (item_id,))
             self._conn.commit()
-        if self._activity is not None:
-            self._activity.tombstone(task_id="memory", ref=f"memory item {item_id}")
+        self._tombstone(item_id)
 
     def sweep_expired(self, now: float | None = None) -> int:
         """Drop proposals whose confirmation window lapsed."""
-        at = now if now is not None else time.time()
+        at = now if now is not None else self._clock.time()
         with self._lock:
-            rows = self._conn.execute(
-                "SELECT id FROM memory WHERE status=? AND expires_at IS NOT NULL "
-                "AND expires_at <= ?",
-                (STATUS_PROPOSED, at),
-            ).fetchall()
-            for row in rows:
-                self.remove(row["id"])
+            with self._conn:
+                # Hold a write reservation across selection and deletion so
+                # confirmation on another connection cannot race this sweep.
+                self._conn.execute("BEGIN IMMEDIATE")
+                rows = self._conn.execute(
+                    "SELECT id FROM memory WHERE status=? AND expires_at IS NOT NULL "
+                    "AND expires_at <= ?",
+                    (STATUS_PROPOSED, at),
+                ).fetchall()
+                self._conn.execute(
+                    "DELETE FROM memory WHERE status=? AND expires_at IS NOT NULL "
+                    "AND expires_at <= ?",
+                    (STATUS_PROPOSED, at),
+                )
+        for row in rows:
+            self._tombstone(row["id"])
         return len(rows)
 
     # -- read paths -----------------------------------------------------------
 
     def get(self, item_id: str) -> MemoryItem | None:
+        self.sweep_expired()
         with self._lock:
             row = self._conn.execute(
                 "SELECT * FROM memory WHERE id=?", (item_id,)
@@ -205,6 +234,7 @@ class MemoryStore:
         kind: str | None = None,
         limit: int = 200,
     ) -> list[MemoryItem]:
+        self.sweep_expired()
         clauses, params = [], []
         if status:
             clauses.append("status=?")
@@ -237,7 +267,7 @@ class MemoryStore:
         return out
 
     def touch(self, item_ids: list[str], at: float | None = None) -> None:
-        now = at if at is not None else time.time()
+        now = at if at is not None else self._clock.time()
         with self._lock:
             for item_id in item_ids:
                 self._conn.execute(
@@ -262,7 +292,7 @@ class MemoryStore:
             content=self._redactor.scrub(content),
             status=status,
             provenance=dict(self._redactor.scrub_dict(provenance)),
-            created_at=at if at is not None else time.time(),
+            created_at=at if at is not None else self._clock.time(),
             expires_at=expires_at,
         )
         with self._lock:
@@ -287,6 +317,10 @@ class MemoryStore:
         if item is None:
             raise ValueError(f"no such memory item {item_id}")
         return item
+
+    def _tombstone(self, item_id: str) -> None:
+        if self._activity is not None:
+            self._activity.tombstone(task_id="memory", ref=f"memory item {item_id}")
 
     def _row_to_item(self, row: sqlite3.Row) -> MemoryItem:
         return MemoryItem(

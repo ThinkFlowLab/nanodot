@@ -4,8 +4,9 @@ Named modes with `readonly` as the enforced MVP default; approvals are
 persisted, inspectable, revocable grants scoped to action type + target +
 scope + expiry; silence is never approval (unanswered requests expire and
 the task stays blocked); denials are recorded; grants are invalidated when
-task scope changes. Belt and suspenders: the mode governs what nanodot
-attempts, the read-only PAT caps what it could do — a bug cannot write.
+task scope changes. The MVP exposes only read-only GitHub operations;
+assert_allowed also denies every external write action. Gated and automatic
+modes are placeholders and cannot enable actions or bypass this gate.
 """
 
 from __future__ import annotations
@@ -85,8 +86,34 @@ CREATE TABLE IF NOT EXISTS requests (
 """
 
 
-def _now() -> float:
-    return time.time()
+def invalidate_task_grants(
+    connection: sqlite3.Connection, task_id: str, now: float
+) -> int:
+    """Invalidate old-scope authorization inside the caller's transaction.
+
+    TaskStore can exist before PermissionCenter creates its tables. Do not
+    create tables or commit here: the scope change and revocation must either
+    both persist or both roll back.
+    """
+    tables = {
+        row[0]
+        for row in connection.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' "
+            "AND name IN ('grants', 'requests')"
+        )
+    }
+    revoked = 0
+    if "grants" in tables:
+        revoked = connection.execute(
+            "UPDATE grants SET revoked_at=? WHERE task_id=? AND revoked_at IS NULL",
+            (now, task_id),
+        ).rowcount
+    if "requests" in tables:
+        connection.execute(
+            "UPDATE requests SET state='expired' WHERE task_id=? AND state='pending'",
+            (task_id,),
+        )
+    return revoked
 
 
 class PermissionCenter:
@@ -105,19 +132,25 @@ class PermissionCenter:
 
     def mode(self) -> Mode:
         try:
-            return Mode(str(Config().get("mode", Mode.READONLY.value)))
+            mode = Mode(str(Config().get("mode", Mode.READONLY.value)))
         except ValueError:
             return Mode.READONLY
+        if mode is not Mode.READONLY:
+            raise ValueError(
+                f"mode {mode.value!r} is not supported; only readonly mode is available"
+            )
+        return mode
 
     def assert_allowed(self, action: str) -> None:
         """The gate every external action must pass. In the read-only MVP
         this raises for any non-read action — there are no write paths."""
         if action in READ_ACTIONS:
             return
-        if self.mode() is Mode.READONLY:
-            raise WriteForbidden(
-                f"action {action!r} is a write; nanodot is in readonly mode"
-            )
+        # Gated/auto are design placeholders, not implemented capabilities.
+        # Neither configuration nor a stored grant can enable MVP write paths.
+        raise WriteForbidden(
+            f"action {action!r} is a write; only readonly mode is supported"
+        )
 
     # -- requests -----------------------------------------------------------
 
@@ -131,14 +164,15 @@ class PermissionCenter:
     ) -> ApprovalRequest:
         """Record what action is wanted, showing action/target/scope/effect.
         Silence never approves: it expires."""
+        now = self._clock.time()
         req = ApprovalRequest(
             id=uuid.uuid4().hex[:12],
             action=action,
             target=target,
             scope=scope,
             task_id=task_id,
-            created_at=self._clock.time(),
-            expires_at=self._clock.time() + ttl,
+            created_at=now,
+            expires_at=now + ttl,
             state="pending",
         )
         with self._lock:
@@ -155,33 +189,41 @@ class PermissionCenter:
     def approve(self, request_id: str) -> Grant:
         """Approval creates a grant scoped to exactly this action + target +
         scope, with an expiry. Nothing broader."""
-        req = self._require_request(request_id)
-        if req.state == "expired":
-            raise ValueError("request expired — silence is not approval; re-request")
-        if req.state != "pending":
-            raise ValueError(f"request is already {req.state}")
-        grant = Grant(
-            id=uuid.uuid4().hex[:12],
-            action=req.action,
-            target=req.target,
-            scope=req.scope,
-            task_id=req.task_id,
-            created_at=self._clock.time(),
-            expires_at=req.expires_at,
-            revoked_at=None,
-        )
         with self._lock:
-            self._conn.execute(
-                "UPDATE requests SET state='approved' WHERE id=?", (request_id,)
-            )
-            self._conn.execute(
-                "INSERT INTO grants VALUES (?,?,?,?,?,?,?,?)",
-                (
-                    grant.id, grant.action, grant.target, grant.scope,
-                    grant.task_id, grant.created_at, grant.expires_at, None,
-                ),
-            )
-            self._conn.commit()
+            # Reserve the write before checking the request, so another
+            # connection cannot approve it twice or change its task's scope
+            # between validation and the grant insert.
+            with self._conn:
+                self._conn.execute("BEGIN IMMEDIATE")
+                now = self._clock.time()
+                self._expire_requests(now)
+                req = self._require_request(request_id)
+                if req.state != "pending":
+                    # Keep expiry persisted even when returning an error.
+                    self._conn.commit()
+                    if req.state == "expired":
+                        raise ValueError("request expired — silence is not approval; re-request")
+                    raise ValueError(f"request is already {req.state}")
+                grant = Grant(
+                    id=uuid.uuid4().hex[:12],
+                    action=req.action,
+                    target=req.target,
+                    scope=req.scope,
+                    task_id=req.task_id,
+                    created_at=now,
+                    expires_at=req.expires_at,
+                    revoked_at=None,
+                )
+                self._conn.execute(
+                    "UPDATE requests SET state='approved' WHERE id=?", (request_id,)
+                )
+                self._conn.execute(
+                    "INSERT INTO grants VALUES (?,?,?,?,?,?,?,?)",
+                    (
+                        grant.id, grant.action, grant.target, grant.scope,
+                        grant.task_id, grant.created_at, grant.expires_at, None,
+                    ),
+                )
         return grant
 
     def deny(self, request_id: str) -> None:
@@ -191,13 +233,9 @@ class PermissionCenter:
     def sweep_expired(self) -> int:
         now = self._clock.time()
         with self._lock:
-            cursor = self._conn.execute(
-                "UPDATE requests SET state='expired' "
-                "WHERE state='pending' AND expires_at <= ?",
-                (now,),
-            )
+            count = self._expire_requests(now)
             self._conn.commit()
-            return cursor.rowcount
+            return count
 
     def pending(self) -> list[ApprovalRequest]:
         return self._requests_where("state='pending'")
@@ -208,10 +246,14 @@ class PermissionCenter:
     # -- grants ---------------------------------------------------------------
 
     def grants(self, active_only: bool = False) -> list[Grant]:
-        where = "revoked_at IS NULL" if active_only else "1=1"
+        where = (
+            "revoked_at IS NULL AND (expires_at IS NULL OR expires_at > ?)"
+            if active_only else "1=1"
+        )
+        params = (self._clock.time(),) if active_only else ()
         with self._lock:
             rows = self._conn.execute(
-                f"SELECT * FROM grants WHERE {where} ORDER BY created_at DESC"
+                f"SELECT * FROM grants WHERE {where} ORDER BY created_at DESC", params
             ).fetchall()
         return [self._row_to_grant(row) for row in rows]
 
@@ -226,9 +268,10 @@ class PermissionCenter:
         """Exact-scope matching: same action on a different target, or a
         different action on the same target, does not match."""
         at = now if now is not None else self._clock.time()
-        for grant in self.grants(active_only=True):
+        for grant in self.grants():
             if (
-                grant.action == action
+                grant.revoked_at is None
+                and grant.action == action
                 and grant.target == target
                 and grant.scope == scope
                 and (task_id is None or grant.task_id == task_id)
@@ -248,18 +291,22 @@ class PermissionCenter:
     def on_scope_change(self, task_id: str) -> int:
         """A task's scope changed: every grant tied to that task dies."""
         with self._lock:
-            cursor = self._conn.execute(
-                "UPDATE grants SET revoked_at=? "
-                "WHERE task_id=? AND revoked_at IS NULL",
-                (self._clock.time(), task_id),
-            )
+            count = invalidate_task_grants(self._conn, task_id, self._clock.time())
             self._conn.commit()
-            return cursor.rowcount
+            return count
 
     # -- internals ----------------------------------------------------------------
 
+    def _expire_requests(self, now: float) -> int:
+        return self._conn.execute(
+            "UPDATE requests SET state='expired' "
+            "WHERE state='pending' AND expires_at <= ?",
+            (now,),
+        ).rowcount
+
     def _transition_request(self, request_id: str, state: str) -> None:
         with self._lock:
+            self._expire_requests(self._clock.time())
             cursor = self._conn.execute(
                 "UPDATE requests SET state=? WHERE id=? AND state='pending'",
                 (state, request_id),
@@ -279,6 +326,8 @@ class PermissionCenter:
 
     def _requests_where(self, where: str) -> list[ApprovalRequest]:
         with self._lock:
+            self._expire_requests(self._clock.time())
+            self._conn.commit()
             rows = self._conn.execute(
                 f"SELECT * FROM requests WHERE {where} ORDER BY created_at DESC"
             ).fetchall()

@@ -24,6 +24,8 @@ class Config:
         return json.loads(self._path.read_text()).get(key, default)
 
     def set(self, key: str, value: object) -> None:
+        if key == "mode" and value != "readonly":
+            raise ValueError("only readonly mode is available; gated/auto modes are not implemented")
         values: dict[str, object] = {}
         if self._path.exists():
             values = json.loads(self._path.read_text())

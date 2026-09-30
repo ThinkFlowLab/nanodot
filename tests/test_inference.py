@@ -95,7 +95,7 @@ def test_api_adapter_summarize_and_parse(monkeypatch) -> None:
             return _chat_response("model summary")
 
     monkeypatch.setattr(
-        "nanodot.native.inference_api.urllib.request.urlopen", fake_urlopen
+        "nanodot.native.inference_api.authenticated_urlopen", fake_urlopen
     )
     provider = APIInferenceProvider(api_key=API_KEY, base_url="https://model.test/v1",
                                     model="m1")
@@ -123,7 +123,7 @@ def test_api_adapter_errors_are_provider_errors(monkeypatch) -> None:
         raise OSError("no network")
 
     monkeypatch.setattr(
-        "nanodot.native.inference_api.urllib.request.urlopen", fake_urlopen
+        "nanodot.native.inference_api.authenticated_urlopen", fake_urlopen
     )
     provider = APIInferenceProvider(api_key=API_KEY)
     with pytest.raises(ProviderError):
@@ -134,7 +134,7 @@ def test_api_adapter_errors_are_provider_errors(monkeypatch) -> None:
         return _Response(b"not json at all")
 
     monkeypatch.setattr(
-        "nanodot.native.inference_api.urllib.request.urlopen", bad_json
+        "nanodot.native.inference_api.authenticated_urlopen", bad_json
     )
     with pytest.raises(ProviderError):
         malformed.parse_intent("watch something")
@@ -235,3 +235,67 @@ def test_cli_intent_with_model_parses(home: Path, capsys, monkeypatch) -> None:
     tasks = TaskStore().list()
     assert str(tasks[0].target) == "owner/repo#9"
     assert tasks[0].purpose == "watch until green"
+
+
+def test_slow_summary_does_not_hold_up_other_tasks(home):
+    import threading
+    import time
+
+    release = threading.Event()
+    calls = []
+
+    class SlowProvider:
+        def summarize(self, change):
+            calls.append(change)
+            release.wait(2)
+            return "late summary"
+
+    provider = SlowProvider()
+    loop, store, sink, first = _loop_with(provider, home)
+    # Small deterministic test budget. Production uses one second.
+    from nanodot.core.runner import _SummaryBudget
+    loop._summaries = _SummaryBudget(0.01)
+    second = store.create(Task(target=TARGET, purpose="another", next_check_at=0.0))
+    try:
+        before = time.monotonic()
+        loop.run_once(first, FakeClock().now)
+        loop.run_once(second, FakeClock().now)
+        assert time.monotonic() - before < 0.5
+        assert len(calls) == 1  # no unbounded backlog/threads while previous hangs
+        assert len(sink.events) == 2
+        assert all(event.summary is None for event in sink.events)
+    finally:
+        release.set()
+
+
+def test_unexpected_summary_exception_degrades_to_raw_notification(home):
+    class BrokenProvider:
+        def summarize(self, change):
+            raise KeyError("malformed adapter")
+
+    loop, store, sink, task = _loop_with(BrokenProvider(), home)
+    loop.run_once(task, FakeClock().now)
+    assert len(sink.events) == 1
+    assert sink.events[0].summary is None
+
+
+def test_cli_runner_wiring_uses_configured_provider(home, monkeypatch):
+    """The real CLI factory must enable summaries as soon as inference exists."""
+    from nanodot.cli import _wiring
+
+    provider = FakeProvider()
+    github = FakeGitHub(TARGET)
+    github.set_pr("open", head_sha="s1")
+    github.add_check("ci", FAILURE, sha="s1")
+    sink = FakeSink()
+    monkeypatch.setattr("nanodot.native.inference_api.configured_provider", lambda: provider)
+    monkeypatch.setattr("nanodot.native.github_client.GitHubSnapshotFetcher", lambda: github)
+    monkeypatch.setattr("nanodot.native.notifier.NativeNotifier", lambda **kwargs: sink)
+
+    _, store, _, _, _, loop = _wiring()
+    task = store.create(Task(target=TARGET, purpose="watch", next_check_at=0.0))
+    loop.run_once(task, FakeClock().now)
+
+    assert len(provider.summarize_payloads) == 1
+    assert sink.kinds() == [CHECKS_FAILED]
+    assert sink.events[0].summary == "A short model summary."
