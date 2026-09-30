@@ -8,7 +8,10 @@ from pathlib import Path
 import pytest
 
 from nanodot.core.redaction import Redactor
-from nanodot.core.tasks import PRTarget, Task, TaskError, TaskState, TaskStore
+from nanodot.core.tasks import (
+    DEFAULT_NOTIFICATION_CONDITIONS, DEFAULT_STOP_CONDITIONS,
+    PRTarget, Task, TaskError, TaskState, TaskStore,
+)
 from nanodot.native.secrets_file import FileSecretStore
 
 
@@ -93,19 +96,17 @@ def test_scope_stored_verbatim_and_version_bumps(home: Path) -> None:
     store = TaskStore()
     task = store.create(
         make_task(
-            notification_conditions="only failures",
-            stop_conditions="stop on merge",
+            notification_conditions=DEFAULT_NOTIFICATION_CONDITIONS,
+            stop_conditions=DEFAULT_STOP_CONDITIONS,
         )
     )
     loaded = store.get(task.id)
-    assert loaded.notification_conditions == "only failures"
-    assert loaded.stop_conditions == "stop on merge"
+    assert loaded.notification_conditions == DEFAULT_NOTIFICATION_CONDITIONS
+    assert loaded.stop_conditions == DEFAULT_STOP_CONDITIONS
     assert loaded.scope_version == 1
 
-    changed = store.update_scope(
-        task.id, notification_conditions="failures and completion"
-    )
-    assert changed.notification_conditions == "failures and completion"
+    changed = store.update_scope(task.id, cadence_seconds=600)
+    assert changed.cadence_seconds == 600
     assert changed.scope_version == 2
 
 
@@ -138,7 +139,6 @@ def test_secrets_never_persist_in_task_text(home: Path) -> None:
         make_task(
             purpose=f"watch using {secret}",
             blocker=None,
-            notification_conditions=f"notify {secret}",
         )
     )
     store.set_blocked(task.id, f"token {secret} rejected")

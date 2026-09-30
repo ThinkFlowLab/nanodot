@@ -113,10 +113,8 @@ def test_auth_loss_blocks_and_requires_user_action(home: Path) -> None:
 
     # User fixes the token and resumes: the watch continues.
     h.github.fail_with(None)
-    h.store.resume(task.id)
-    task = h.store.get(h.task.id)
-    task.next_check_at = h.clock.now
-    h.store.update(task)
+    h.store.resume(task.id, now=h.clock.now)
+    assert [item.id for item in h.store.list_schedulable(h.clock.now)] == [task.id]
     assert h.tick() is RunOutcome.OK
 
 
