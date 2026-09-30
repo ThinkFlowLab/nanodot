@@ -13,6 +13,7 @@ from enum import Enum
 
 from nanodot.core import statemachine
 from nanodot.core.activity import ActivityLog
+from nanodot.core.memory import MemoryStore
 from nanodot.core.statemachine import WatchEvent
 from nanodot.core.tasks import Task, TaskStore
 from nanodot.ports.github import (
@@ -76,12 +77,14 @@ class TaskLoop:
         sink: NotificationSink,
         activity: ActivityLog,
         provider: InferenceProvider | None = None,
+        memory: MemoryStore | None = None,
     ) -> None:
         self._store = store
         self._fetcher = fetcher
         self._sink = sink
         self._activity = activity
         self._provider = provider
+        self._memory = memory
         self._locks: dict[str, threading.Lock] = {}
         self._locks_guard = threading.Lock()
 
@@ -144,6 +147,19 @@ class TaskLoop:
 
         terminal = any(event.terminal for event in events)
         if terminal:
+            terminal_event = next(e for e in events if e.terminal)
+            if self._memory is not None:
+                # Write path 2: evidenced terminal outcome, auto-recorded
+                # as an observation with provenance to the evidence.
+                self._memory.add_observation(
+                    content=f"{task.target}: {terminal_event.message}",
+                    task_id=task.id,
+                    evidence_ref=(
+                        f"{terminal_event.evidence.get('url', '')}@"
+                        f"{terminal_event.evidence.get('head_sha', '')}"
+                    ),
+                    at=now,
+                )
             task.next_check_at = None
             self._store.update(task)
             self._store.complete(task.id)

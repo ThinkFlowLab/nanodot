@@ -66,6 +66,26 @@ def build_parser() -> argparse.ArgumentParser:
         cmd = watch_sub.add_parser(action, help=f"{action} a task")
         cmd.add_argument("task_id")
 
+    # -- memory ------------------------------------------------------------
+    memory = subparsers.add_parser("memory", help="what nanodot retained, and why")
+    memory_sub = memory.add_subparsers(dest="memory_command", required=True)
+    memory_sub.add_parser("list", help="retained items with provenance")
+    m_add = memory_sub.add_parser("add", help="remember something (confirmed)")
+    m_add.add_argument("content")
+    m_add.add_argument("--kind", default="preference",
+                       choices=["preference", "observation", "fact"])
+    m_propose = memory_sub.add_parser("propose", help="add a proposal to confirm later")
+    m_propose.add_argument("content")
+    m_show = memory_sub.add_parser("show", help="one item in full")
+    m_show.add_argument("item_id")
+    m_confirm = memory_sub.add_parser("confirm", help="confirm a proposal")
+    m_confirm.add_argument("item_id")
+    m_edit = memory_sub.add_parser("edit", help="correct an item")
+    m_edit.add_argument("item_id")
+    m_edit.add_argument("--content", required=True)
+    m_rm = memory_sub.add_parser("rm", help="delete an item")
+    m_rm.add_argument("item_id")
+
     # -- activity / inbox --------------------------------------------------
     activity = subparsers.add_parser("activity", help="what actually ran")
     activity.add_argument("task_id", nargs="?")
@@ -87,10 +107,12 @@ def build_parser() -> argparse.ArgumentParser:
 
 def _wiring() -> tuple:
     from nanodot.core.activity import ActivityLog
+    from nanodot.core.memory import MemoryStore
     from nanodot.core.redaction import Redactor
     from nanodot.core.runner import TaskLoop
     from nanodot.core.tasks import TaskStore
     from nanodot.native.github_client import GitHubSnapshotFetcher
+    from nanodot.native.inference_api import configured_provider
     from nanodot.native.notifier import NativeNotifier
     from nanodot.native.secrets_file import FileSecretStore
 
@@ -98,9 +120,13 @@ def _wiring() -> tuple:
     redactor = Redactor(secrets)
     store = TaskStore(redactor=redactor)
     activity = ActivityLog(redactor=redactor)
+    memory = MemoryStore(redactor=redactor, activity=activity)
     sink = NativeNotifier(redactor=redactor, os_notify=_os_notifications_enabled())
     fetcher = GitHubSnapshotFetcher()
-    loop = TaskLoop(store, fetcher, sink, activity)
+    loop = TaskLoop(
+        store, fetcher, sink, activity,
+        provider=configured_provider(), memory=memory,
+    )
     return secrets, store, activity, sink, fetcher, loop
 
 
@@ -151,7 +177,10 @@ def _run_watch(args: argparse.Namespace) -> int:
     from nanodot.core.tasks import PRTarget, Task, TaskError
     from nanodot.native.secrets_file import FileSecretStore
 
-    secrets, store, activity, sink, _, _ = _wiring()
+    secrets, store, activity, sink, _, loop = _wiring()
+    from nanodot.core.memory import MemoryStore
+
+    memory = MemoryStore(activity=activity)
 
     if args.watch_command == "add":
         if not secrets.get("github-token"):
@@ -204,6 +233,11 @@ def _run_watch(args: argparse.Namespace) -> int:
         print(f"  allowed actions:        read-only (no external writes)")
         print(f"  notification conditions:{task.notification_conditions}")
         print(f"  stop conditions:        {task.stop_conditions}")
+        relevant = memory.relevant_to(f"{task.target} {task.purpose}")
+        if relevant:
+            print("  remembered context:")
+            for item in relevant:
+                print(f"    - {item.content}")
         if not args.yes:
             answer = input("Proceed? [y/N] ").strip().lower()
             if answer not in ("y", "yes"):
@@ -260,6 +294,54 @@ def _run_watch(args: argparse.Namespace) -> int:
         for entry in reversed(entries):
             print(f"    {_fmt_time(entry.at)}  {entry.kind}: {entry.message}")
     return 0
+
+
+def _run_memory(args: argparse.Namespace) -> int:
+    from nanodot.core.memory import MemoryStore
+
+    memory = MemoryStore()
+    try:
+        if args.memory_command == "add":
+            item = memory.add_user(args.content, kind=args.kind)
+            print(f"remembered {item.id} (confirmed)")
+        elif args.memory_command == "propose":
+            item = memory.propose(args.content, source="user-proposal")
+            print(f"proposed {item.id} — confirm with: nanodot memory confirm {item.id}")
+        elif args.memory_command == "confirm":
+            item = memory.confirm(args.item_id)
+            print(f"confirmed {item.id}")
+        elif args.memory_command == "edit":
+            item = memory.edit(args.item_id, args.content)
+            print(f"edited {item.id}")
+        elif args.memory_command == "rm":
+            memory.remove(args.item_id)
+            print(f"deleted {args.item_id} (activity keeps a tombstone)")
+        elif args.memory_command == "show":
+            item = memory.get(args.item_id)
+            if item is None:
+                print(f"error: no such memory item {args.item_id}", file=sys.stderr)
+                return 1
+            _print_memory_item(item)
+        else:  # list
+            items = memory.list()
+            if not items:
+                print("memory is empty")
+            for item in items:
+                _print_memory_item(item)
+        return 0
+    except ValueError as error:
+        print(f"error: {error}", file=sys.stderr)
+        return 1
+
+
+def _print_memory_item(item) -> None:
+    source = item.provenance.get("source", "?")
+    evidence = item.provenance.get("evidence", "")
+    suffix = f" evidence={evidence}" if evidence else ""
+    print(
+        f"{item.id}  [{item.status:<9}] [{item.kind:<11}] {item.content}\n"
+        f"            source={source}{suffix} created={_fmt_time(item.created_at)}"
+    )
 
 
 # -- activity / inbox -----------------------------------------------------------
@@ -389,6 +471,8 @@ def main(argv: list[str] | None = None) -> int:
         return _run_config(args)
     if args.command == "watch":
         return _run_watch(args)
+    if args.command == "memory":
+        return _run_memory(args)
     if args.command == "activity":
         return _run_activity(args)
     if args.command == "inbox":
