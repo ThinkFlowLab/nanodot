@@ -16,7 +16,42 @@ python -m pip install -e '.[dev]'
 nanodot --help
 ```
 
-Configure an existing GitHub read-only token with a hidden terminal prompt:
+## First use: watch a public PR
+
+Try the complete offline lifecycle first (no token, model, or network):
+
+```sh
+python examples/first_pr_watch.py
+```
+
+It runs eight scenarios through the real CLI in separate processes, including
+an actual crash/restart, inbox deduplication, stale-commit rejection, and stop.
+The PR transitions are simulated; the CLI, native parsing, runner and database
+are real. The output includes a report and command transcript.
+
+For a real public PR, use an isolated data home and explicit anonymous access:
+
+```sh
+export NANODOT_HOME="$(mktemp -d)"
+nanodot config set github-auth-mode anonymous
+nanodot config set os-notifications false
+nanodot watch add owner/repo#123 --cadence 1800 --yes
+nanodot runner --once
+nanodot watch list
+nanodot inbox
+```
+
+Anonymous mode never sends a GitHub token, even if one is saved. Stop the runner
+before changing authentication mode or OS-notification settings, then restart
+it; live changes to those settings are rejected. Public metadata
+can be restricted and has a smaller API quota; 30-minute polling is a cautious
+starting point. Unknown required-check rules stay pending. No token or model is
+needed. See the [first-use walkthrough](docs/first-pr-watch.md) for the full
+lifecycle, background runner, cancellation, and verification details.
+
+For private repositories or authenticated reads, keep the default token mode
+(or set `github-auth-mode token`) and configure an existing read-only token with
+a hidden terminal prompt:
 
 ```sh
 nanodot config set github-token

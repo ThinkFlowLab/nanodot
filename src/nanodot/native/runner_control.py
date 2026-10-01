@@ -15,6 +15,7 @@ import secrets
 import tempfile
 import threading
 import time
+from collections.abc import Callable
 from contextlib import contextmanager
 from pathlib import Path
 from typing import BinaryIO, Iterator
@@ -97,6 +98,20 @@ def startup_lock(pidfile: Path, timeout: float = 5.0) -> Iterator[None]:
         yield
 
 
+@contextmanager
+def configuration_lock(pidfile: Path) -> Iterator[None]:
+    """Hold runner policy stable against both background and foreground starts.
+
+    Configuration changes never publish a runner record. The lifetime lock
+    stays held through the write, closing the gap between status and mutation.
+    """
+    with startup_lock(pidfile):
+        with _open_lock(_lock_path(pidfile)) as handle:
+            if not _try_lock(handle):
+                raise RunnerAlreadyRunning("runner is already running")
+            yield
+
+
 class RunnerLease:
     """Hold exclusive runner ownership until the scheduler has fully stopped.
 
@@ -104,7 +119,10 @@ class RunnerLease:
     passes. ``stop`` is the same Event passed to ``RunnerDaemon.serve``.
     """
 
-    def __init__(self, pidfile: Path, stop: threading.Event) -> None:
+    def __init__(
+        self, pidfile: Path, stop: threading.Event,
+        *, prepare: Callable[[], None] | None = None,
+    ) -> None:
         self.pidfile = pidfile
         self.pid = os.getpid()
         self._record = {"pid": self.pid, "token": secrets.token_hex(32)}
@@ -112,6 +130,7 @@ class RunnerLease:
         self._finished = threading.Event()
         self._handle: BinaryIO | None = None
         self._thread: threading.Thread | None = None
+        self._prepare = prepare
 
     def __enter__(self) -> RunnerLease:
         self._handle = _open_lock(_lock_path(self.pidfile))
@@ -126,8 +145,14 @@ class RunnerLease:
             self._handle = None
             raise RunnerAlreadyRunning("runner is already running")
         try:
-            # Only the lifetime-lock owner may clear an old runner's files.
+            # Ownership proves these files cannot belong to a live runner.
+            # Remove stale readiness before preparation can block or fail.
+            self.pidfile.unlink(missing_ok=True)
             _stop_path(self.pidfile).unlink(missing_ok=True)
+            # Load configuration while owning the lifetime lock, before
+            # publishing readiness. A failed setup must never look started.
+            if self._prepare is not None:
+                self._prepare()
             _write_record(self.pidfile, self._record)
             self._thread = threading.Thread(
                 target=self._watch_stop, name="nanodot-runner-control", daemon=True,

@@ -116,6 +116,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 def _wiring() -> tuple:
     from nanodot.core.activity import ActivityLog
+    from nanodot.core.config import Config
     from nanodot.core.memory import MemoryStore
     from nanodot.core.redaction import Redactor
     from nanodot.core.runner import TaskLoop
@@ -125,13 +126,18 @@ def _wiring() -> tuple:
     from nanodot.native.notifier import NativeNotifier
     from nanodot.native.secrets_file import FileSecretStore
 
+    auth_mode = str(Config().get("github-auth-mode", "token"))
+    os_notify = _os_notifications_enabled()
     secrets = FileSecretStore()
     redactor = Redactor(secrets)
     store = TaskStore(redactor=redactor)
     activity = ActivityLog(redactor=redactor)
     memory = MemoryStore(redactor=redactor, activity=activity)
-    sink = NativeNotifier(redactor=redactor, os_notify=_os_notifications_enabled())
-    fetcher = GitHubSnapshotFetcher()
+    sink = NativeNotifier(redactor=redactor, os_notify=os_notify)
+    fetcher = (
+        GitHubSnapshotFetcher(auth_mode=auth_mode)
+        if auth_mode == "anonymous" else GitHubSnapshotFetcher()
+    )
     loop = TaskLoop(
         store, fetcher, sink, activity,
         provider=configured_provider(), memory=memory,
@@ -142,7 +148,7 @@ def _wiring() -> tuple:
 def _os_notifications_enabled() -> bool:
     from nanodot.core.config import Config
 
-    return bool(Config().get("os-notifications", True))
+    return Config().get("os-notifications", True) is True
 
 
 def _fmt_time(ts: float | None) -> str:
@@ -155,6 +161,33 @@ def _fmt_time(ts: float | None) -> str:
 
 
 def _run_config(args: argparse.Namespace) -> int:
+    # These settings are loaded once when a runner starts. Never report a
+    # successful change while an existing runner would keep the old policy.
+    if (
+        args.config_command in ("set", "unset")
+        and args.name in {"github-auth-mode", "os-notifications"}
+    ):
+        from nanodot.native.runner_control import (
+            RunnerAlreadyRunning, RunnerControlError, configuration_lock,
+        )
+
+        try:
+            with configuration_lock(_pidfile()):
+                return _run_config_values(args)
+        except RunnerAlreadyRunning:
+            print(
+                f"error: cannot change {args.name} while the runner is running; "
+                "run nanodot stop, change the setting, then nanodot start",
+                file=sys.stderr,
+            )
+            return 1
+        except (RunnerControlError, OSError) as error:
+            print(f"error: {error}", file=sys.stderr)
+            return 1
+    return _run_config_values(args)
+
+
+def _run_config_values(args: argparse.Namespace) -> int:
     from nanodot.core.config import Config
     from nanodot.core.redaction import MASK, is_secret_name
     from nanodot.native.secrets_file import FileSecretStore
@@ -214,7 +247,14 @@ def _run_watch(args: argparse.Namespace) -> int:
     activity = ActivityLog(redactor=redactor)
 
     if args.watch_command == "add":
-        if not secrets.get("github-token"):
+        from nanodot.core.config import Config
+
+        try:
+            auth_mode = Config().get("github-auth-mode", "token")
+        except ValueError as error:
+            print(f"error: {error}", file=sys.stderr)
+            return 1
+        if auth_mode == "token" and not secrets.get("github-token"):
             print(
                 "error: no GitHub token configured — run: "
                 "nanodot config set github-token (hidden prompt)",
@@ -271,6 +311,8 @@ def _run_watch(args: argparse.Namespace) -> int:
         print(f"  purpose:                {task.purpose}")
         print(f"  cadence:                every {task.cadence_seconds}s")
         print(f"  allowed actions:        read-only (no external writes)")
+        if auth_mode == "anonymous":
+            print("  GitHub access:          anonymous (public repositories only)")
         print(f"  notification conditions:{task.notification_conditions}")
         print(f"  stop conditions:        {task.stop_conditions}")
         relevant = memory.relevant_to(f"{task.target} {task.purpose}")
@@ -466,10 +508,17 @@ def _run_runner(args: argparse.Namespace) -> int:
     def _sigint(_signum, _frame) -> None:
         stop.set()
 
-    try:
+    store = None
+    daemon = None
+
+    def prepare() -> None:
+        nonlocal store, daemon
         _, store, _, _, _, loop = _wiring()
         daemon = RunnerDaemon(loop, store)
-        with RunnerLease(_pidfile(), stop):
+
+    try:
+        with RunnerLease(_pidfile(), stop, prepare=prepare):
+            assert store is not None and daemon is not None
             if args.once:
                 attempted = daemon.tick()
                 blockers = [t for t in store.list() if t.blocker]
@@ -486,7 +535,7 @@ def _run_runner(args: argparse.Namespace) -> int:
             daemon.serve(stop)
             print("nanodot runner stopped")
             return 0
-    except (RunnerControlError, OSError) as error:
+    except (RunnerControlError, OSError, ValueError) as error:
         print(f"error: {error}", file=sys.stderr)
         return 1
 

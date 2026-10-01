@@ -1,7 +1,8 @@
-"""Native GitHub client — read-only REST access via a read-only PAT.
+"""Native GitHub client — read-only REST access via a PAT or anonymously.
 
 Only GET requests are ever issued (enforced by the permissions invariant
-test): the client exposes fetch and nothing else.
+test): the client exposes fetch and nothing else. Anonymous mode only has
+access to public metadata and never reads or sends a configured token.
 """
 
 from __future__ import annotations
@@ -39,11 +40,18 @@ class GitHubSnapshotFetcher(SnapshotFetcher):
         self,
         token: str | None = None,
         base_url: str = API_BASE,
+        *,
+        auth_mode: str = "token",
     ) -> None:
-        self._token = token
+        if auth_mode not in ("token", "anonymous"):
+            raise ValueError("github-auth-mode must be token or anonymous")
+        self._auth_mode = auth_mode
+        self._token = token if auth_mode == "token" else None
         self._base_url = base_url.rstrip("/")
 
-    def _auth_token(self) -> str:
+    def _auth_token(self) -> str | None:
+        if self._auth_mode == "anonymous":
+            return None
         if self._token is not None:
             return self._token
         token = FileSecretStore().get(TOKEN_SECRET)
@@ -55,13 +63,16 @@ class GitHubSnapshotFetcher(SnapshotFetcher):
 
     def _get(self, path: str) -> dict | list:
         url = f"{self._base_url}{path}"
+        headers = {
+            "Accept": "application/vnd.github+json",
+            "X-GitHub-Api-Version": "2022-11-28",
+        }
+        token = self._auth_token()
+        if token is not None:
+            headers["Authorization"] = f"Bearer {token}"
         request = urllib.request.Request(
             url,
-            headers={
-                "Accept": "application/vnd.github+json",
-                "Authorization": f"Bearer {self._auth_token()}",
-                "X-GitHub-Api-Version": "2022-11-28",
-            },
+            headers=headers,
             method="GET",
         )
         try:
@@ -73,8 +84,9 @@ class GitHubSnapshotFetcher(SnapshotFetcher):
         except urllib.error.HTTPError as error:
             body = error.read().decode(errors="replace")
             if error.code == 401:
+                access = "anonymous access" if self._auth_mode == "anonymous" else "the token"
                 raise AuthLostError(
-                    f"GitHub rejected the token ({error.code})"
+                    f"GitHub rejected {access} ({error.code})"
                 ) from error
             if error.code == 403:
                 if (

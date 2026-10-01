@@ -19,6 +19,7 @@ from nanodot.native.runner_control import (
     RunnerAlreadyRunning,
     RunnerControlError,
     RunnerLease,
+    configuration_lock,
     running_pid,
     startup_lock,
     stop_runner,
@@ -182,6 +183,63 @@ def test_startup_lock_serializes_and_has_a_deadline(tmp_path: Path) -> None:
             with startup_lock(pidfile, timeout=0.01):
                 pytest.fail("two startup commands acquired ownership")
     with startup_lock(pidfile):
+        pass
+
+
+def test_configuration_lock_excludes_foreground_start_without_publishing(
+    tmp_path: Path,
+) -> None:
+    pidfile = tmp_path / "runner.pid"
+    prepare = mock.Mock()
+    with configuration_lock(pidfile):
+        assert not pidfile.exists()
+        with pytest.raises(RunnerAlreadyRunning):
+            with RunnerLease(pidfile, threading.Event(), prepare=prepare):
+                pytest.fail("runner started during configuration update")
+        prepare.assert_not_called()
+        with pytest.raises(RunnerControlError, match="start/stop command"):
+            with startup_lock(pidfile, timeout=0):
+                pytest.fail("background start bypassed configuration update")
+    with RunnerLease(pidfile, threading.Event(), prepare=prepare):
+        prepare.assert_called_once_with()
+
+
+def test_runner_prepares_under_ownership_before_publishing_readiness(tmp_path: Path) -> None:
+    pidfile = tmp_path / "runner.pid"
+
+    def prepare() -> None:
+        assert not pidfile.exists()
+        with pytest.raises(RunnerAlreadyRunning):
+            with configuration_lock(pidfile):
+                pytest.fail("configuration changed during runner setup")
+
+    with RunnerLease(pidfile, threading.Event(), prepare=prepare):
+        assert running_pid(pidfile) == os.getpid()
+
+
+@pytest.mark.parametrize("stale_record", [False, True])
+def test_failed_preparation_never_publishes_readiness_and_releases_lock(
+    tmp_path: Path, stale_record: bool,
+) -> None:
+    pidfile = tmp_path / "runner.pid"
+    if stale_record:
+        record = json.dumps({"pid": os.getpid(), "token": "a" * 64})
+        pidfile.write_text(record)
+        pidfile.with_suffix(".stop").write_text(record)
+
+    def prepare() -> None:
+        assert not pidfile.exists()
+        assert not pidfile.with_suffix(".stop").exists()
+        with pytest.raises(RunnerControlError, match="metadata is unavailable"):
+            running_pid(pidfile)
+        raise ValueError("invalid configuration")
+
+    with pytest.raises(ValueError, match="invalid configuration"):
+        with RunnerLease(pidfile, threading.Event(), prepare=prepare):
+            pytest.fail("runner became ready with invalid configuration")
+    assert not pidfile.exists()
+    assert running_pid(pidfile) is None
+    with configuration_lock(pidfile):
         pass
 
 
