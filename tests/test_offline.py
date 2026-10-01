@@ -1,5 +1,6 @@
 """Offline enforcement starts during tests, not dependency installation."""
 import os
+import re
 import socket
 import urllib.request
 from pathlib import Path
@@ -13,8 +14,21 @@ def test_ci_dead_proxy_is_scoped_to_test_step():
     assert "actions/checkout" in setup
     assert 'pip install -e ".[dev]"' in setup
     assert "HTTP_PROXY" not in setup
-    assert "HTTP_PROXY:" in test and "http_proxy:" in test
-    assert "run: pytest -q" in test
+    assert "HTTP_PROXY:" in test
+    assert 'export http_proxy="$HTTP_PROXY" https_proxy="$HTTPS_PROXY"' in test
+    assert 'export all_proxy="$ALL_PROXY" no_proxy="$NO_PROXY"' in test
+    assert "python -m pytest -q" in test
+
+
+def test_ci_env_keys_are_case_insensitively_unique():
+    # GitHub rejects HTTP_PROXY + http_proxy in the same env mapping before
+    # any jobs run. Shell exports safely provide the lowercase aliases.
+    workflow = (Path(__file__).resolve().parents[1] / ".github/workflows/ci.yml").read_text()
+    test = workflow.split("- name: Test (offline, all fakes)", maxsplit=1)[1]
+    mapping = test.split("env:", maxsplit=1)[1].split("run:", maxsplit=1)[0]
+    keys = re.findall(r"^\s+([A-Za-z_][A-Za-z0-9_]*):", mapping, re.MULTILINE)
+    assert len(keys) == len({key.casefold() for key in keys})
+    assert set(keys) == {"HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY"}
 
 
 def test_subprocesses_inherit_dead_proxy_settings():

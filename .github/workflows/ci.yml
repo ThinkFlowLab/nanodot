@@ -23,8 +23,9 @@ jobs:
           HTTPS_PROXY: "http://127.0.0.1:9"
           ALL_PROXY: "http://127.0.0.1:9"
           NO_PROXY: ""
-          http_proxy: "http://127.0.0.1:9"
-          https_proxy: "http://127.0.0.1:9"
-          all_proxy: "http://127.0.0.1:9"
-          no_proxy: ""
-        run: pytest -q
+        run: |
+          # Actions env keys are case-insensitive; define lowercase aliases
+          # in the shell so both spellings reach pytest and its subprocesses.
+          export http_proxy="$HTTP_PROXY" https_proxy="$HTTPS_PROXY"
+          export all_proxy="$ALL_PROXY" no_proxy="$NO_PROXY"
+          python -m pytest -q
