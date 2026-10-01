@@ -14,5 +14,17 @@ jobs:
           python-version: "3.12"
       - name: Install
         run: pip install -e ".[dev]"
-      - name: Test
+      - name: Test (offline, all fakes)
+        env:
+          # Restrict offline enforcement to tests; checkout and installation
+          # need network access. The autouse socket guard in conftest.py also
+          # rejects direct network calls that do not honor proxy variables.
+          HTTP_PROXY: "http://127.0.0.1:9"
+          HTTPS_PROXY: "http://127.0.0.1:9"
+          ALL_PROXY: "http://127.0.0.1:9"
+          NO_PROXY: ""
+          http_proxy: "http://127.0.0.1:9"
+          https_proxy: "http://127.0.0.1:9"
+          all_proxy: "http://127.0.0.1:9"
+          no_proxy: ""
         run: pytest -q

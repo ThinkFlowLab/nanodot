@@ -1,0 +1,84 @@
+"""The native scheduler/executor: a long-lived polling daemon.
+
+Restart recovery is reconciliation, not replay: on start it simply runs
+whatever is due. The state machine dedups unchanged snapshots and the
+notification sink dedups by event key, so a restart after downtime
+produces current state — never a flood of missed notifications.
+"""
+
+from __future__ import annotations
+
+import logging
+import threading
+import time
+
+from nanodot.core.runner import TaskLoop, backoff_seconds
+from nanodot.core.tasks import Task, TaskState, TaskStore
+
+logger = logging.getLogger(__name__)
+
+
+class RunnerDaemon:
+    def __init__(
+        self,
+        loop: TaskLoop,
+        store: TaskStore,
+        tick_seconds: float = 1.0,
+        clock=time,
+    ) -> None:
+        self._loop = loop
+        self._store = store
+        self._tick = tick_seconds
+        self._clock = clock
+
+    def tick(self) -> int:
+        """One scheduler pass: run every due task once. Returns the number
+        of tasks attempted."""
+        now = self._clock.time()
+        attempted = 0
+        for task in self._store.list_schedulable(now):
+            attempted += 1
+            try:
+                self._loop.run_once(task, now)
+            except Exception:
+                # Adapter bugs and optional-service failures must not stop
+                # unrelated watches. Never log exception text: remote payloads
+                # and provider errors can contain credentials or private data.
+                logger.warning("task %s raised an unexpected error", task.id)
+                self._retry_failed_task(task, now)
+        return attempted
+
+    def _retry_failed_task(self, task: Task, now: float) -> None:
+        try:
+            # run_once may have mutated its input before failing. Retry from
+            # committed state, not a half-finished (possibly terminal) state.
+            current = self._store.get(task.id)
+            if current is None or current.state is not TaskState.ACTIVE:
+                return
+            try:
+                failures = max(
+                    0, int(current.watch_state.get("consecutive_failures", 0))
+                ) + 1
+            except (TypeError, ValueError, OverflowError):
+                failures = 1
+            current.watch_state = dict(
+                current.watch_state,
+                consecutive_failures=failures,
+                last_success_at=current.watch_state.get("last_success_at", now),
+            )
+            current.next_check_at = now + backoff_seconds(
+                current.cadence_seconds, min(failures, 12)
+            )
+            current.blocker = "unexpected task failure; retry scheduled"
+            self._store.update(current)
+        except Exception:
+            # Even a damaged store/error-reporting path must not prevent the
+            # remaining tasks in this scheduler pass from being attempted.
+            logger.error("could not persist failure for task %s", task.id)
+
+    def serve(self, stop: threading.Event, poll_seconds: float | None = None) -> None:
+        """Foreground loop; stop by setting the event."""
+        interval = poll_seconds if poll_seconds is not None else self._tick
+        while not stop.is_set():
+            self.tick()
+            stop.wait(interval)
