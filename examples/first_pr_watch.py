@@ -20,6 +20,7 @@ import sqlite3
 import subprocess
 import sys
 import tempfile
+from urllib.error import HTTPError
 from urllib.parse import urlsplit
 from unittest.mock import patch
 
@@ -51,15 +52,24 @@ def fake_cli(fixture_path: Path, argv: list[str]) -> int:
             response = {"head": {"sha": head}, "base": {"ref": "main"},
                         "state": "open", "merged": False}
         elif path == "/repos/demo/nanodot/branches/main":
-            response = {"protected": True, "protection": {"required_status_checks": {
-                "contexts": ["test"], "checks": [{"context": "test", "app_id": None}]}}}
+            rules = fixture.get("rules", "required")
+            if rules == "hidden":
+                raise HTTPError(request.full_url, 403, "hidden rules", {}, io.BytesIO(b"{}"))
+            if rules == "empty":
+                response = {"protected": False}
+            else:
+                response = {"protected": True, "protection": {"required_status_checks": {
+                    "contexts": ["test"], "checks": [{"context": "test", "app_id": None}]}}}
         elif path == "/repos/demo/nanodot/rules/branches/main":
             response = []
         elif path.endswith("/check-suites"):
             response = {"total_count": 0, "check_suites": []}
         elif path.endswith("/status"):
+            statuses = [{"id": 10, "context": "test", "state": state}]
+            if "optional" in fixture:
+                statuses.append({"id": 11, "context": "optional", "state": fixture["optional"]})
             response = {"sha": SHA_A if fixture.get("stale") else head,
-                        "total_count": 1, "statuses": [{"id": 10, "context": "test", "state": state}]}
+                        "total_count": len(statuses), "statuses": statuses}
         else:
             raise AssertionError(f"unexpected demo HTTP request: {path}")
         return io.BytesIO(json.dumps(response).encode())
@@ -71,7 +81,10 @@ def fake_cli(fixture_path: Path, argv: list[str]) -> int:
 
     def notify_then_crash(self, event):
         original_notify(self, event)
-        if fixture.get("crash_after_inbox") and event.kind == "checks-failed":
+        crash_kind = fixture.get("crash_after_inbox")
+        if crash_kind is True:  # preserve the original demo fixture spelling
+            crash_kind = "checks-failed"
+        if event.kind == crash_kind:
             # A real process death after the durable inbox write, before the
             # task checkpoint. The next fresh runner must not duplicate it.
             os._exit(86)
@@ -145,17 +158,17 @@ class Demo:
         assert self.rows("tasks")[0]["state"] == "active"
         self.record("pending current-head CI stays quiet")
 
-        self.set_fixture(result="failure", crash_after_inbox=True)
+        self.set_fixture(result="failure", optional="pending", crash_after_inbox=True)
         self.wake(task_id)
         self.cli("runner", "--once", expected=86)
         assert len(self.rows("inbox")) == 1
         assert self.rows("tasks")[0]["state"] == "active"
-        self.set_fixture(result="failure")
+        self.set_fixture(result="failure", optional="success")
         self.cli("runner", "--once")
         self.wake(task_id)
         self.cli("runner", "--once")
         assert len(self.rows("inbox")) == 1
-        self.record("hard crash and restart preserve exactly one failure inbox entry")
+        self.record("hard crash with changed optional evidence still leaves one failure inbox entry")
 
         self.set_fixture(head=SHA_B)
         self.wake(task_id)

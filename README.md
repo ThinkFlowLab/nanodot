@@ -45,8 +45,8 @@ Anonymous mode never sends a GitHub token, even if one is saved. Stop the runner
 before changing authentication mode or OS-notification settings, then restart
 it; live changes to those settings are rejected. Public metadata
 can be restricted and has a smaller API quota; 30-minute polling is a cautious
-starting point. Unknown required-check rules stay pending. No token or model is
-needed. See the [first-use walkthrough](docs/first-pr-watch.md) for the full
+starting point. Unknown required-check rules cannot complete a watch, but
+observed current-head failures still notify. No token or model is needed. See the [first-use walkthrough](docs/first-pr-watch.md) for the full
 lifecycle, background runner, cancellation, and verification details.
 
 For private repositories or authenticated reads, keep the default token mode
@@ -109,7 +109,8 @@ Optional failures do not block a confirmed required-check pass.
 Conservative limits:
 
 - No configured required checks keeps a watch active until the PR closes or
-  merges; optional green checks are not treated as proof of a requirement
+  merges; optional green checks are not treated as proof of a requirement.
+  Observed current-head failures still notify when rules are empty or hidden
 - Neutral/skipped results stay pending; nanodot requires literal success
 - App-bound legacy statuses cannot be proven from REST creator identity, so
   they stay pending when app provenance cannot be verified

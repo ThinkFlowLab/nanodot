@@ -14,7 +14,7 @@ from __future__ import annotations
 import hashlib
 from dataclasses import dataclass, field, replace
 
-from nanodot.core.github_eval import CheckOutcome, FAILING_CONCLUSIONS, evaluate_checks
+from nanodot.core.github_eval import CheckOutcome, evaluate_checks, failing_checks_on_current_commit
 from nanodot.core.tasks import Task
 from nanodot.ports.github import Snapshot
 
@@ -178,8 +178,7 @@ def step(task: Task, snapshot: Snapshot, now: float) -> tuple[dict, list[WatchEv
         if state.get("last_outcome") != CheckOutcome.FAILING.value:
             failing = [
                 run.name
-                for run in snapshot.checks_for(snapshot.head_sha)
-                if run.conclusion in FAILING_CONCLUSIONS
+                for run in failing_checks_on_current_commit(snapshot)
             ]
             events.append(
                 _event(

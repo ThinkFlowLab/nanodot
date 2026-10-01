@@ -31,12 +31,17 @@ class RunnerDaemon:
         self._tick = tick_seconds
         self._clock = clock
 
-    def tick(self) -> int:
-        """One scheduler pass: run every due task once. Returns the number
-        of tasks attempted."""
+    def tick(self, stop: threading.Event | None = None) -> int:
+        """Run due tasks once, checking for shutdown before each new task.
+
+        An in-flight task finishes and persists its progress. Returns the
+        number of tasks attempted; omitting ``stop`` runs the full pass.
+        """
         now = self._clock.time()
         attempted = 0
         for task in self._store.list_schedulable(now):
+            if stop is not None and stop.is_set():
+                break
             attempted += 1
             try:
                 self._loop.run_once(task, now)
@@ -80,5 +85,5 @@ class RunnerDaemon:
         """Foreground loop; stop by setting the event."""
         interval = poll_seconds if poll_seconds is not None else self._tick
         while not stop.is_set():
-            self.tick()
+            self.tick(stop=stop)
             stop.wait(interval)

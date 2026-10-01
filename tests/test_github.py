@@ -270,6 +270,54 @@ def test_missing_unknown_or_incomplete_required_checks_never_pass(required, comp
                                  required=required, complete=complete)) is expected
 
 
+@pytest.mark.parametrize("required", [None, ()])
+@pytest.mark.parametrize("source", ["check_run", "status"])
+def test_observed_failure_survives_unknown_or_empty_requirements(required, source) -> None:
+    run = CheckRun("ci", COMPLETED, FAILURE, "abc123", source=source)
+    snap = _snap(run, required=required)
+    assert evaluate_checks(snap) is CheckOutcome.FAILING
+    assert not checks_passing_on_current_commit(snap)
+
+
+@pytest.mark.parametrize("required,expected", [(None, CheckOutcome.PENDING), ((), CheckOutcome.NO_CHECKS)])
+@pytest.mark.parametrize("change", [
+    {"sha": "old-head"},
+    {"status": QUEUED},
+    {"conclusion": SUCCESS},
+    {"source": "check_suite"},
+])
+def test_unknown_or_empty_rules_only_report_actual_current_failures(required, expected, change) -> None:
+    run = replace(CheckRun("ci", COMPLETED, FAILURE, "abc123"), **change)
+    assert evaluate_checks(_snap(run, required=required)) is expected
+
+
+@pytest.mark.parametrize("required,expected", [(None, CheckOutcome.PENDING), ((), CheckOutcome.NO_CHECKS)])
+@pytest.mark.parametrize("source", ["check_run", "status"])
+@pytest.mark.parametrize("status,conclusion", [(COMPLETED, SUCCESS), (QUEUED, None)])
+def test_failure_without_requirements_uses_latest_rerun(required, expected, source, status, conclusion) -> None:
+    old = CheckRun("ci", COMPLETED, FAILURE, "abc123", source=source,
+                   app_id=10, suite_id=1, run_id=1)
+    latest = replace(old, status=status, conclusion=conclusion, run_id=2)
+    assert evaluate_checks(_snap(latest, old, required=required)) is expected
+
+
+@pytest.mark.parametrize("required", [None, ()])
+@pytest.mark.parametrize("change", [
+    {"suite_id": 2}, {"app_id": 20}, {"source": "status"}, {"run_id": None},
+])
+def test_failure_without_requirements_does_not_merge_independent_runs(required, change) -> None:
+    old = CheckRun("ci", COMPLETED, FAILURE, "abc123", app_id=10, suite_id=1, run_id=1)
+    other = replace(replace(old, conclusion=SUCCESS, run_id=2), **change)
+    assert evaluate_checks(_snap(old, other, required=required)) is CheckOutcome.FAILING
+
+
+@pytest.mark.parametrize("required", [None, (), (RequiredCheck("ci"),)])
+def test_partial_snapshot_cannot_establish_a_current_failure(required) -> None:
+    # A partial listing may omit a newer queued/successful rerun.
+    run = CheckRun("ci", COMPLETED, FAILURE, "abc123", run_id=1)
+    assert evaluate_checks(_snap(run, required=required, complete=False)) is CheckOutcome.PENDING
+
+
 def test_required_failures_outrank_pending_and_missing() -> None:
     runs = (CheckRun("ci", COMPLETED, FAILURE, "abc123"), CheckRun("lint", QUEUED, None, "abc123"))
     required = (RequiredCheck("ci"), RequiredCheck("lint"), RequiredCheck("missing"))
@@ -381,6 +429,24 @@ def test_unprotected_branch_still_reads_rulesets_and_empty_is_not_a_pass(monkeyp
     assert snap.required_checks == ()
     assert evaluate_checks(snap) is CheckOutcome.NO_CHECKS
     assert any("/rules/branches/" in call.full_url for call in calls)
+
+
+@pytest.mark.parametrize("metadata", ["empty", "hidden-branch", "hidden-rules", "unsupported"])
+def test_native_failure_survives_empty_or_unknown_rules(monkeypatch, metadata) -> None:
+    def override(path, query):
+        hidden_path = {"hidden-branch": "/branches/main", "hidden-rules": "/rules/branches/main"}.get(metadata)
+        if hidden_path is not None and path.endswith(hidden_path):
+            raise HTTPError(path, 403, "hidden", {}, io.BytesIO(b"{}"))
+
+    kwargs = {"runs": [_run(conclusion=FAILURE)], "override": override}
+    if metadata == "empty":
+        kwargs["branch"] = {"protected": False}
+    elif metadata == "unsupported":
+        kwargs["rules"] = [{"type": "required_workflows"}]
+    snap, _ = _fetch(monkeypatch, **kwargs)
+    assert snap.required_checks == (() if metadata == "empty" else None)
+    assert snap.checks_complete
+    assert evaluate_checks(snap) is CheckOutcome.FAILING
 
 
 @pytest.mark.parametrize("part", ["run", "suite", "status"])

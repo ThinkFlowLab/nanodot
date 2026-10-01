@@ -14,11 +14,12 @@ import pytest
 from nanodot.cli import _os_notifications_enabled, main
 from nanodot.core.config import Config
 from nanodot.core.github_eval import CheckOutcome, evaluate_checks
-from nanodot.core.tasks import PRTarget, TaskStore
+from nanodot.core.tasks import PRTarget, Task, TaskState, TaskStore
 from nanodot.native.github_client import GitHubSnapshotFetcher
 from nanodot.native.notifier import NativeNotifier
 from nanodot.native.runner_control import (
-    RunnerAlreadyRunning, RunnerLease, configuration_lock,
+    RunnerAlreadyRunning, RunnerControlError, RunnerLease, configuration_lock,
+    stop_runner,
 )
 from nanodot.native.secrets_file import FileSecretStore
 from nanodot.ports.github import AuthLostError, PRNotFoundError, RetryableError
@@ -90,6 +91,55 @@ def test_saved_anonymous_mode_is_used_by_runner(home: Path, capsys) -> None:
     sink.close()
     os_delivery.assert_not_called()
     assert "ran 0 task(s)" in capsys.readouterr().out
+
+
+def test_once_runner_stop_during_fetch_skips_remaining_tasks(home: Path, capsys) -> None:
+    Config().set("github-auth-mode", "anonymous")
+    Config().set("os-notifications", False)
+    store = TaskStore()
+    tasks = [
+        store.create(Task(
+            target=PRTarget.parse(f"o/r#{number}"), purpose="watch", next_check_at=number,
+        ))
+        for number in range(1, 4)
+    ]
+    stop_events = []
+    calls = []
+
+    def lease(pidfile, stop, *, prepare):
+        stop_events.append(stop)
+        return RunnerLease(pidfile, stop, prepare=prepare)
+
+    def fetch(request, timeout):
+        calls.append(request.full_url)
+        if len(calls) == 1:
+            # Request an actual cooperative stop while this fetch is in
+            # flight. Ownership cannot be released until its result commits.
+            with pytest.raises(RunnerControlError, match="stop is still pending"):
+                stop_runner(home / "runner.pid", timeout=0)
+            assert stop_events[0].wait(2)
+        return _response(_pull())
+
+    with (
+        mock.patch("nanodot.native.runner_control.RunnerLease", side_effect=lease),
+        mock.patch("nanodot.native.github_client.authenticated_urlopen", fetch),
+    ):
+        assert main(["runner", "--once"]) == 0
+
+    assert calls == ["https://api.github.com/repos/o/r/pulls/1"]
+    assert "ran 1 task(s)" in capsys.readouterr().out
+    assert not (home / "runner.pid").exists()
+    assert not (home / "runner.stop").exists()
+    first = store.get(tasks[0].id)
+    assert first.state is TaskState.COMPLETED
+    assert first.next_check_at is None
+    assert first.watch_state["terminal"]
+    for untouched in tasks[1:]:
+        assert store.get(untouched.id) == untouched
+    sink = NativeNotifier(os_notify=False)
+    assert [entry.task_id for entry in sink.list()] == [first.id]
+    sink.close()
+    store.close()
 
 
 @pytest.mark.parametrize("inline", [False, True])

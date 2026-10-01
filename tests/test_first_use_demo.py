@@ -5,6 +5,8 @@ from pathlib import Path
 import subprocess
 import sys
 
+import pytest
+
 
 def test_first_use_demo_offline(tmp_path: Path):
     root = Path(__file__).resolve().parents[1]
@@ -36,3 +38,84 @@ def test_demo_refuses_existing_data(tmp_path: Path):
     assert result.returncode != 0
     assert "must be empty" in result.stderr
     assert (home / "keep.txt").read_text() == "untouched"
+
+
+def _demo(tmp_path: Path):
+    """Reuse the fake HTTP boundary, with each CLI command in a fresh process."""
+    import importlib.util
+
+    root = Path(__file__).resolve().parents[1]
+    spec = importlib.util.spec_from_file_location("first_pr_watch", root / "examples" / "first_pr_watch.py")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    home = tmp_path / "cli-home"
+    home.mkdir()
+    demo = module.Demo(home)
+    demo.cli("config", "set", "github-auth-mode", "anonymous")
+    demo.cli("config", "set", "os-notifications", "false")
+    demo.cli("watch", "add", module.TARGET, "--yes", "--cadence", "300")
+    return demo, demo.rows("tasks")[0]["id"]
+
+
+# These tests exercise the actual crash boundary, not a caught Python error:
+# NativeNotifier commits, then the child dies before TaskLoop saves its state.
+
+
+@pytest.mark.parametrize("result,kind,final_state", [
+    ("failure", "checks-failed", "active"),
+    ("success", "checks-passed", "completed"),
+])
+def test_crash_replay_with_changed_optional_status(tmp_path, result, kind, final_state):
+    demo, task_id = _demo(tmp_path)
+    demo.set_fixture(result="pending", optional="pending")
+    demo.cli("runner", "--once")
+    before = json.loads(demo.rows("tasks")[0]["watch_state"])
+    demo.wake(task_id)
+    demo.set_fixture(result=result, optional="pending", crash_after_inbox=kind)
+    demo.cli("runner", "--once", expected=86)
+    assert len(demo.rows("inbox")) == 1
+    delivered = demo.rows("inbox")[0]
+    assert delivered["kind"] == kind
+    assert demo.rows("tasks")[0]["state"] == "active"
+    assert json.loads(demo.rows("tasks")[0]["watch_state"]) == before
+
+    # Only unrelated evidence changes. The task/head/required outcome do not.
+    demo.set_fixture(result=result, optional="success")
+    demo.cli("runner", "--once")
+    assert demo.rows("inbox") == [delivered]
+    task = demo.rows("tasks")[0]
+    assert task["state"] == final_state
+    assert json.loads(task["watch_state"])["event_sequence"] == before.get("event_sequence", 0) + 1
+    if final_state == "completed":
+        assert task["next_check_at"] is None
+    else:
+        demo.wake(task_id)
+    requests = demo.requests()
+    demo.cli("runner", "--once")
+    assert demo.rows("inbox") == [delivered]
+    if final_state == "completed":
+        assert demo.requests() == requests
+
+
+@pytest.mark.parametrize("rules", ["empty", "hidden"])
+def test_anonymous_cli_alerts_failures_without_known_required_checks(tmp_path, rules):
+    demo, task_id = _demo(tmp_path)
+    demo.set_fixture(rules=rules, result="pending")
+    demo.cli("runner", "--once")
+    assert demo.rows("inbox") == []
+    demo.wake(task_id)
+    demo.set_fixture(rules=rules, result="failure")
+    demo.cli("runner", "--once")
+    assert [row["kind"] for row in demo.rows("inbox")] == ["checks-failed"]
+    assert demo.rows("tasks")[0]["state"] == "active"
+    evidence = json.loads(demo.rows("inbox")[0]["evidence"])
+    assert evidence["required_checks"] == ([] if rules == "empty" else None)
+    demo.wake(task_id)
+    demo.cli("runner", "--once")
+    assert len(demo.rows("inbox")) == 1
+    demo.wake(task_id)
+    demo.set_fixture(rules=rules, result="success")
+    demo.cli("runner", "--once")
+    assert [row["kind"] for row in demo.rows("inbox")] == ["checks-failed"]
+    assert demo.rows("tasks")[0]["state"] == "active"
+    assert demo.rows("tasks")[0]["next_check_at"] is not None

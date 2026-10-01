@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
+
 import pytest
 from fakes import COMPLETED, FAILURE, QUEUED, SUCCESS, FakeGitHub
 
@@ -16,6 +18,7 @@ from nanodot.core.statemachine import (
     step,
 )
 from nanodot.core.tasks import PRTarget, Task
+from nanodot.ports.github import CheckRun, RequiredCheck
 
 TARGET = PRTarget.parse("thinkflowlab/nanodot#3")
 
@@ -163,3 +166,70 @@ def test_pending_recovery_from_failure_is_recorded_not_notified() -> None:
     task, events = stepped(fake, task, now=1100.0)
     pendings = [e for e in events if e.kind == CHECKS_PENDING]
     assert pendings and not pendings[0].notable
+
+
+@pytest.mark.parametrize("required", [None, ()])
+def test_failure_without_requirements_notifies_once_and_recovery_keeps_watching(required) -> None:
+    fake = FakeGitHub(TARGET)
+    ready(fake)
+    fake.add_check("ci", FAILURE, sha="s1")
+    failed = replace(fake.snapshot(), required_checks=required)
+    task = make_task()
+
+    task.watch_state, events = step(task, failed, now=1000.0)
+    assert [event.kind for event in events] == [CHECKS_FAILED]
+    assert events[0].notable and not events[0].terminal
+    assert events[0].evidence["required_checks_known"] is (required is not None)
+    assert events[0].message.endswith(": ci")
+    assert not task.watch_state.get("terminal")
+
+    task.watch_state, events = step(task, failed, now=1100.0)
+    assert events == []
+
+    recovered = replace(failed, checks=(replace(failed.checks[0], conclusion=SUCCESS),))
+    task.watch_state, events = step(task, recovered, now=1200.0)
+    assert [event.kind for event in events] == [CHECKS_PENDING]
+    assert not events[0].notable and not events[0].terminal
+    assert not task.watch_state.get("terminal")
+
+    task.watch_state, events = step(task, failed, now=1300.0)
+    assert [event.kind for event in events] == [CHECKS_FAILED]
+    assert not task.watch_state.get("terminal")
+
+
+@pytest.mark.parametrize("required", [None, ()])
+def test_failure_without_requirements_is_reset_by_new_head(required) -> None:
+    fake = FakeGitHub(TARGET)
+    ready(fake)
+    fake.add_check("ci", FAILURE, sha="s1")
+    failed = replace(fake.snapshot(), required_checks=required)
+    task = make_task()
+    task.watch_state, _ = step(task, failed, now=1000.0)
+
+    # The old commit's failure is still visible but does not apply to s2.
+    new_head = replace(failed, head_sha="s2")
+    task.watch_state, events = step(task, new_head, now=1100.0)
+    assert [event.kind for event in events] == [NEW_COMMIT, CHECKS_PENDING]
+    assert not task.watch_state.get("terminal")
+
+    failed_head = replace(new_head, checks=new_head.checks + (replace(failed.checks[0], sha="s2"),))
+    task.watch_state, events = step(task, failed_head, now=1200.0)
+    assert [event.kind for event in events] == [CHECKS_FAILED]
+    assert events[0].evidence["head_sha"] == "s2"
+
+
+@pytest.mark.parametrize("required", [None, (), (RequiredCheck("lint"),)])
+def test_failure_notification_names_only_latest_current_failures(required) -> None:
+    fake = FakeGitHub(TARGET)
+    ready(fake)
+    old = CheckRun("ci", COMPLETED, FAILURE, "s1", app_id=10, suite_id=1, run_id=1)
+    recovered = replace(old, conclusion=SUCCESS, run_id=2)
+    failing = replace(old, name="lint", run_id=3)
+    stale = replace(old, name="old-commit", sha="old-head")
+    incomplete = replace(old, name="running", status=QUEUED, run_id=4)
+    snap = replace(fake.snapshot(), checks=(old, recovered, failing, stale, incomplete),
+                   required_checks=required)
+
+    _, events = step(make_task(), snap, now=1000.0)
+    assert [event.kind for event in events] == [CHECKS_FAILED]
+    assert events[0].message.endswith(": lint")

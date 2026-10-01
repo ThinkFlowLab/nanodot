@@ -520,7 +520,7 @@ def _run_runner(args: argparse.Namespace) -> int:
         with RunnerLease(_pidfile(), stop, prepare=prepare):
             assert store is not None and daemon is not None
             if args.once:
-                attempted = daemon.tick()
+                attempted = daemon.tick(stop=stop)
                 blockers = [t for t in store.list() if t.blocker]
                 if blockers:
                     for task in blockers:

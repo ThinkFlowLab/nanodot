@@ -2,8 +2,8 @@
 notification for notable/terminal events.
 
 Channel follows the proposed default from issue #1 (macOS notification +
-inbox), pending confirmation in review. Dedup is by event content key and
-survives restarts, so a runner replaying after downtime notifies once.
+inbox), pending confirmation in review. Dedup uses the durable transition
+identity, so changing snapshot details do not duplicate a replay after a crash.
 """
 
 from __future__ import annotations
@@ -37,17 +37,30 @@ def _default_osascript(*args: object, **kwargs: object) -> None:
 
 
 def event_key(event: WatchEvent) -> str:
-    """Stable identity of an event: same content, same key, one delivery."""
-    payload = json.dumps(
-        {
+    """Identify a transition independently of mutable snapshot evidence.
+
+    The persisted per-task sequence is replayed until its task checkpoint.
+    Kind and head distinguish genuinely different transitions observed before
+    that checkpoint (for example a newer commit after a crash). Optional check
+    results, message text, summaries and poll timestamps are not its identity.
+    Unsequenced adapter events retain the legacy content-based fallback.
+    """
+    if event.occurrence:
+        identity = {
+            "task_id": event.task_id,
+            "occurrence": event.occurrence,
+            "kind": event.kind,
+            "head_sha": event.evidence.get("head_sha", ""),
+        }
+    else:
+        identity = {
             "task_id": event.task_id,
             "occurrence": event.occurrence,
             "kind": event.kind,
             "message": event.message,
             "evidence": event.evidence,
-        },
-        sort_keys=True,
-    )
+        }
+    payload = json.dumps(identity, sort_keys=True)
     return hashlib.sha256(payload.encode()).hexdigest()
 
 

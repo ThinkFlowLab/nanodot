@@ -38,17 +38,37 @@ def _latest(runs: tuple[CheckRun, ...]) -> list[CheckRun]:
     return selected
 
 
+def failing_checks_on_current_commit(snapshot: Snapshot) -> tuple[CheckRun, ...]:
+    """Observed failures independent of whether required-check rules are known.
+
+    A partial listing might omit a newer rerun. Only report failures from a
+    complete, current-head listing, using the same source/app/suite ordering
+    as required-check evaluation.
+    """
+    if snapshot.checks_complete is not True:
+        return ()
+    return tuple(
+        run for run in _latest(snapshot.checks_for(snapshot.head_sha))
+        if run.source in {"check_run", "status"}
+        and run.status == "completed" and run.conclusion in FAILING_CONCLUSIONS
+    )
+
+
 def evaluate_checks(snapshot: Snapshot) -> CheckOutcome:
     """Require a complete, known required set and actual success for each.
 
     This intentionally remains stricter than GitHub's merge gate: skipped
     and neutral conclusions are not a confirmed success. No required checks
-    is not a vacuous terminal pass. This is not a mergeability assessment.
+    is not a vacuous terminal pass. Unknown/empty rules cannot authorize
+    success, but do not hide observed failures. This is not a mergeability
+    assessment.
     """
-    if snapshot.checks_complete is not True or snapshot.required_checks is None:
+    if snapshot.checks_complete is not True:
         return CheckOutcome.PENDING
     if not snapshot.required_checks:
-        return CheckOutcome.NO_CHECKS
+        if failing_checks_on_current_commit(snapshot):
+            return CheckOutcome.FAILING
+        return CheckOutcome.PENDING if snapshot.required_checks is None else CheckOutcome.NO_CHECKS
     runs = _latest(snapshot.checks_for(snapshot.head_sha))
     relevant: list[CheckRun] = []
     pending = False

@@ -190,3 +190,33 @@ def test_same_sha_failure_recurrence_delivered_once_per_occurrence_after_restart
     store.close()
     activity.close()
     sink.close()
+
+
+@pytest.mark.parametrize("kind", [CHECKS_FAILED, CHECKS_PASSED])
+def test_sequenced_replay_ignores_changed_evidence_and_text(notifier, kind):
+    first = make_event(kind=kind, occurrence="7", evidence={
+        "head_sha": "abc123", "checks": [{"name": "optional", "conclusion": "pending"}],
+    })
+    replay = make_event(kind=kind, occurrence="7", at=2000, message="refreshed wording", evidence={
+        "head_sha": "abc123", "checks": [{"name": "optional", "conclusion": "success"}],
+    })
+    notifier.notify(first)
+    notifier.notify(replay)
+    assert len(notifier.list()) == 1
+    assert len(notifier.recorder.calls) == 1
+    # A replay keeps the original evidence from the durable delivery.
+    assert notifier.list()[0].evidence == first.evidence
+    assert notifier.list()[0].message == first.message
+
+
+@pytest.mark.parametrize("change", [
+    {"task_id": "other-task"},
+    {"occurrence": "8"},
+    {"kind": CHECKS_PASSED},
+    {"evidence": {"head_sha": "def456"}},
+])
+def test_transition_identity_does_not_hide_distinct_events(notifier, change):
+    notifier.notify(make_event(occurrence="7"))
+    notifier.notify(make_event(**({"occurrence": "7"} | change)))
+    assert len(notifier.list()) == 2
+    assert len(notifier.recorder.calls) == 2

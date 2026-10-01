@@ -31,7 +31,8 @@ The assertions cover:
 
 1. Pending CI on commit A stays quiet
 2. Failed CI writes one inbox entry, then the process exits abruptly before its
-   task checkpoint; restarting and rereading the same failure adds no duplicate
+   task checkpoint; restarting after an unrelated optional status changes adds
+   no duplicate
 3. Commit B creates one new-commit notification and invalidates A's result
 4. A stale successful status response for A cannot complete the watch for B
 5. Successful required CI for B creates one terminal notification and completion
@@ -45,8 +46,10 @@ Expected summary: **8 scenarios passed** and exactly three inbox entries:
 The printed directory contains `demo-report.json`, `demo-transcript.txt`, the
 fake-HTTP request log, and the inspectable `nanodot.db`. No credentials are saved.
 The script leaves no runner active. It is also part of the offline test suite.
-The crash assertion proves inbox deduplication for this replay boundary, not a
-blanket guarantee about arbitrary filesystem corruption or OS notifications.
+The crash assertion proves inbox deduplication for this replay boundary, even
+when optional-check evidence changes before recovery. The offline tests also
+exercise this boundary for terminal success. This is not a blanket guarantee
+about arbitrary filesystem corruption or OS notifications.
 
 ## 2. Try a real public PR without credentials
 
