@@ -119,3 +119,47 @@ def test_anonymous_cli_alerts_failures_without_known_required_checks(tmp_path, r
     assert [row["kind"] for row in demo.rows("inbox")] == ["checks-failed"]
     assert demo.rows("tasks")[0]["state"] == "active"
     assert demo.rows("tasks")[0]["next_check_at"] is not None
+
+
+def test_anonymous_cli_alerts_optional_failure_while_required_checks_pending(tmp_path):
+    demo, task_id = _demo(tmp_path)
+    demo.set_fixture(result="pending", optional="pending")
+    demo.cli("runner", "--once")
+    assert demo.rows("inbox") == []
+    demo.wake(task_id)
+    demo.set_fixture(result="pending", optional="failure")
+    demo.cli("runner", "--once")
+    delivered = demo.rows("inbox")[0]
+    assert delivered["kind"] == "checks-failed"
+    assert delivered["message"].endswith(": optional")
+    assert demo.rows("tasks")[0]["state"] == "active"
+    evidence = json.loads(delivered["evidence"])
+    assert evidence["required_checks"] == [{"name": "test", "app_id": None}]
+    demo.wake(task_id)
+    demo.cli("runner", "--once")
+    assert demo.rows("inbox") == [delivered]
+
+    # Recovery of the optional result does not complete pending requirements.
+    demo.wake(task_id)
+    demo.set_fixture(result="pending", optional="success")
+    demo.cli("runner", "--once")
+    assert demo.rows("inbox") == [delivered]
+    assert demo.rows("tasks")[0]["state"] == "active"
+    demo.wake(task_id)
+    demo.set_fixture(result="pending", optional="failure")
+    demo.cli("runner", "--once")
+    assert [row["kind"] for row in demo.rows("inbox")] == ["checks-failed", "checks-failed"]
+
+    # Confirmed required success still wins over a failed optional check.
+    demo.wake(task_id)
+    demo.set_fixture(result="success", optional="failure")
+    demo.cli("runner", "--once")
+    assert [row["kind"] for row in demo.rows("inbox")] == [
+        "checks-failed", "checks-failed", "checks-passed",
+    ]
+    task = demo.rows("tasks")[0]
+    assert task["state"] == "completed" and task["next_check_at"] is None
+    requests = demo.requests()
+    demo.cli("runner", "--once")
+    assert demo.requests() == requests
+    assert len(demo.rows("inbox")) == 3

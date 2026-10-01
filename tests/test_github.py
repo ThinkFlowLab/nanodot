@@ -329,6 +329,43 @@ def test_optional_failure_does_not_block_required_success() -> None:
                                  CheckRun("optional", COMPLETED, FAILURE, "abc123"))) is CheckOutcome.PASSING
 
 
+@pytest.mark.parametrize("source", ["check_run", "status"])
+@pytest.mark.parametrize("required_runs,required", [
+    ((CheckRun("ci", QUEUED, None, "abc123"),), (RequiredCheck("ci"),)),
+    ((), (RequiredCheck("ci"),)),
+    ((CheckRun("ci", COMPLETED, "neutral", "abc123"),), (RequiredCheck("ci"),)),
+    ((CheckRun("ci", COMPLETED, "skipped", "abc123"),), (RequiredCheck("ci"),)),
+    ((CheckRun("ci", COMPLETED, SUCCESS, "abc123"),
+      CheckRun("", QUEUED, None, "abc123", source="check_suite")), (RequiredCheck("ci"),)),
+    ((CheckRun("ci", COMPLETED, SUCCESS, "abc123", app_id=10),), (RequiredCheck("ci", 20),)),
+    ((CheckRun("ci", COMPLETED, SUCCESS, "abc123", source="status"),), (RequiredCheck("ci", 20),)),
+    ((), (RequiredCheck(""),)),
+])
+def test_optional_failure_notifies_until_required_success_is_confirmed(source, required_runs, required) -> None:
+    failed = CheckRun("optional", COMPLETED, FAILURE, "abc123", source=source)
+    snap = _snap(*required_runs, failed, required=required)
+    assert evaluate_checks(snap) is CheckOutcome.FAILING
+    assert not checks_passing_on_current_commit(snap)
+
+
+@pytest.mark.parametrize("change", [
+    {"sha": "old-head"}, {"status": QUEUED}, {"conclusion": SUCCESS},
+    {"source": "check_suite"}, {"source": "unknown"},
+])
+def test_pending_required_checks_ignore_unconfirmed_optional_failures(change) -> None:
+    failed = replace(CheckRun("optional", COMPLETED, FAILURE, "abc123"), **change)
+    assert evaluate_checks(_snap(CheckRun("ci", QUEUED, None, "abc123"), failed)) is CheckOutcome.PENDING
+
+
+@pytest.mark.parametrize("source", ["check_run", "status"])
+@pytest.mark.parametrize("status,conclusion", [(COMPLETED, SUCCESS), (QUEUED, None)])
+def test_optional_failure_with_pending_requirements_uses_latest_rerun(source, status, conclusion) -> None:
+    old = CheckRun("optional", COMPLETED, FAILURE, "abc123", source=source,
+                   app_id=10, suite_id=1, run_id=1)
+    latest = replace(old, status=status, conclusion=conclusion, run_id=2)
+    assert evaluate_checks(_snap(CheckRun("ci", QUEUED, None, "abc123"), old, latest)) is CheckOutcome.PENDING
+
+
 def test_check_and_same_name_status_must_both_pass() -> None:
     check = CheckRun("ci", COMPLETED, SUCCESS, "abc123", app_id=10)
     legacy = CheckRun("CI", "queued", "pending", "abc123", source="status")

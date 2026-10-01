@@ -55,19 +55,28 @@ def failing_checks_on_current_commit(snapshot: Snapshot) -> tuple[CheckRun, ...]
 
 
 def evaluate_checks(snapshot: Snapshot) -> CheckOutcome:
+    """Prefer confirmed required success, otherwise report observed failures.
+
+    Optional failures cannot prevent a confirmed required-check pass, but
+    they still notify while success is pending or requirements are unknown.
+    Both evaluations require a complete, current-head check listing.
+    """
+    outcome = _evaluate_required_checks(snapshot)
+    if outcome is not CheckOutcome.PASSING and failing_checks_on_current_commit(snapshot):
+        return CheckOutcome.FAILING
+    return outcome
+
+
+def _evaluate_required_checks(snapshot: Snapshot) -> CheckOutcome:
     """Require a complete, known required set and actual success for each.
 
     This intentionally remains stricter than GitHub's merge gate: skipped
     and neutral conclusions are not a confirmed success. No required checks
-    is not a vacuous terminal pass. Unknown/empty rules cannot authorize
-    success, but do not hide observed failures. This is not a mergeability
-    assessment.
+    is not a vacuous terminal pass. This is not a mergeability assessment.
     """
     if snapshot.checks_complete is not True:
         return CheckOutcome.PENDING
     if not snapshot.required_checks:
-        if failing_checks_on_current_commit(snapshot):
-            return CheckOutcome.FAILING
         return CheckOutcome.PENDING if snapshot.required_checks is None else CheckOutcome.NO_CHECKS
     runs = _latest(snapshot.checks_for(snapshot.head_sha))
     relevant: list[CheckRun] = []

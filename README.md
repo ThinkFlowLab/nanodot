@@ -104,7 +104,8 @@ A passing result requires a complete paginated snapshot and known required
 check rules for the PR's base branch. Missing required contexts, stale commits,
 unknown rules, or inaccessible metadata cannot satisfy a watch. Legacy commit
 statuses are included; latest reruns are evaluated without mixing app sources.
-Optional failures do not block a confirmed required-check pass.
+Observed current-head failures, including optional checks, notify while required
+success is unconfirmed. Optional failures do not block a confirmed required-check pass.
 
 Conservative limits:
 
