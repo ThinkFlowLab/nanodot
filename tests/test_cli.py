@@ -270,3 +270,22 @@ def test_concurrent_config_and_secret_writes_keep_all_keys(home: Path) -> None:
     store = FileSecretStore()
     for index in range(4):
         assert store.get(f"secret-{index}") is not None
+
+
+def test_activity_hides_observations_unless_all(
+    home: Path, token: str, capsys: pytest.CaptureFixture[str]
+) -> None:
+    assert _add_watch() == 0
+    task = TaskStore().list()[0]
+    log = ActivityLog()
+    log.append(task.id, "check-observed", "observed abc1234567 (open)", at=1000.0)
+    log.append(task.id, "checks-failed", "ci failing on abc", at=1000.0)
+
+    assert main(["activity", task.id]) == 0
+    out = capsys.readouterr().out
+    assert "checks-failed" in out
+    assert "check-observed" not in out
+
+    assert main(["activity", task.id, "--all"]) == 0
+    out = capsys.readouterr().out
+    assert "check-observed" in out and "checks-failed" in out

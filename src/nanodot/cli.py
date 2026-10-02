@@ -98,6 +98,8 @@ def build_parser() -> argparse.ArgumentParser:
     # -- activity / inbox --------------------------------------------------
     activity = subparsers.add_parser("activity", help="what actually ran")
     activity.add_argument("task_id", nargs="?")
+    activity.add_argument("--all", action="store_true",
+                          help="include per-poll check observations")
     subparsers.add_parser("inbox", help="notifications received")
 
     # -- runner ------------------------------------------------------------
@@ -263,6 +265,7 @@ def _run_watch(args: argparse.Namespace) -> int:
 
     from nanodot.core.activity import ActivityLog
     from nanodot.core.redaction import Redactor
+    from nanodot.core.runner import CHECK_OBSERVED
     from nanodot.core.tasks import TaskStore
 
     secrets = FileSecretStore()
@@ -375,7 +378,9 @@ def _run_watch(args: argparse.Namespace) -> int:
             print("no tasks — create one with: nanodot watch add owner/repo#1")
             return 0
         for task in tasks:
-            latest = activity.query(task_id=task.id, limit=1)
+            latest = activity.query(
+                task_id=task.id, exclude_kinds=(CHECK_OBSERVED,), limit=1
+            )
             latest_text = latest[0].message if latest else "-"
             if len(latest_text) > 60:
                 latest_text = latest_text[:57] + "..."
@@ -401,7 +406,9 @@ def _run_watch(args: argparse.Namespace) -> int:
     print(f"  state:                  {task.state.value}")
     if task.blocker:
         print(f"  blocker:                {task.blocker}")
-    entries = activity.query(task_id=task.id, limit=5)
+    entries = activity.query(
+        task_id=task.id, exclude_kinds=(CHECK_OBSERVED,), limit=5
+    )
     if entries:
         print("  recent activity:")
         for entry in reversed(entries):
@@ -500,9 +507,13 @@ def _run_approvals(_: argparse.Namespace) -> int:
 
 def _run_activity(args: argparse.Namespace) -> int:
     from nanodot.core.activity import ActivityLog
+    from nanodot.core.runner import CHECK_OBSERVED
 
     activity = ActivityLog()
-    entries = activity.query(task_id=getattr(args, "task_id", None), limit=50)
+    exclude = None if args.all else (CHECK_OBSERVED,)
+    entries = activity.query(
+        task_id=getattr(args, "task_id", None), exclude_kinds=exclude, limit=50
+    )
     if not entries:
         print("no activity yet")
         return 0

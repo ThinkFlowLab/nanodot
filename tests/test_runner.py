@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import sqlite3
 import threading
 from pathlib import Path
 
@@ -9,7 +10,7 @@ import pytest
 from fakes import FAILURE, FakeClock, FakeGitHub, FakeSink, SUCCESS, TYPICAL_ERRORS
 
 from nanodot.core.activity import ActivityLog
-from nanodot.core.runner import RunOutcome, TaskLoop, backoff_seconds
+from nanodot.core.runner import CHECK_OBSERVED, RunOutcome, TaskLoop, backoff_seconds
 from nanodot.core.statemachine import BLOCKED, CHECKS_FAILED, CHECKS_PASSED
 from nanodot.core.tasks import PRTarget, Task, TaskState, TaskStore
 from nanodot.native.daemon import RunnerDaemon
@@ -143,9 +144,47 @@ def test_events_recorded_to_activity_with_evidence(home: Path) -> None:
     h.github.add_check("ci", FAILURE, sha="s1")
     h.tick()
     entries = h.activity.query(task_id=h.task.id)
-    assert [e.kind for e in entries] == [CHECKS_FAILED]
+    # Newest first: the event, then the observation that produced it
+    # (reversed() replays insertion order: observe → decide → act).
+    assert [e.kind for e in entries] == [CHECKS_FAILED, CHECK_OBSERVED]
+    assert [e.kind for e in reversed(entries)][0] == CHECK_OBSERVED
     assert entries[0].evidence["head_sha"] == "s1"
+    assert entries[0].evidence["rule"] == "notify: checks failing on the current commit"
     assert CHECKS_FAILED in h.sink.kinds()
+
+
+def test_every_poll_leaves_an_observation_entry(home: Path) -> None:
+    h = Harness(home)
+    h.github.add_check("ci", None, sha="s1", status="queued")
+    h.tick()
+    h.clock.advance(CADENCE)
+    h.tick()  # unchanged snapshot: no events, still observed
+    entries = h.activity.query(task_id=h.task.id)
+    observations = [e for e in entries if e.kind == CHECK_OBSERVED]
+    assert len(observations) == 2
+    digest = observations[0].evidence
+    assert digest["head_sha"] == "s1"
+    assert digest["pr_state"] == "open"
+    assert digest["fingerprint"]
+    assert [c["name"] for c in digest["checks"]] == ["ci"]
+    assert [c["name"] for c in digest["required_checks"]] == ["ci"]
+    # A no-op poll produces nothing else — the observation is the record.
+    assert [e.kind for e in entries if e.kind != CHECK_OBSERVED] == []
+
+
+def test_activity_failure_does_not_fail_the_run(home: Path) -> None:
+    h = Harness(home)
+    h.github.add_check("ci", FAILURE, sha="s1")
+
+    class BrokenLog:
+        def append(self, **_: object) -> None:
+            raise sqlite3.OperationalError("disk I/O error")
+
+    h.loop._activity = BrokenLog()
+    assert h.tick() is RunOutcome.OK
+    assert CHECKS_FAILED in h.sink.kinds()  # delivery unaffected
+    task = h.store.get(h.task.id)
+    assert task.next_check_at is not None  # the watch keeps its schedule
 
 
 def test_secrets_never_in_activity(home: Path) -> None:

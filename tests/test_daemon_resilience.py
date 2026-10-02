@@ -177,7 +177,9 @@ def test_shutdown_finishes_current_task_without_starting_next(
     else:
         assert first.state is TaskState.ACTIVE
         assert first.next_check_at == clock.time() + first.cadence_seconds
-    assert [entry.task_id for entry in recovered_activity.query()] == [first.id]
+    # Only the finished task wrote anything (its poll observation plus the
+    # event it produced); the unstarted tasks left no entries.
+    assert {entry.task_id for entry in recovered_activity.query()} == {first.id}
     assert [task.id for task in recovered.list_schedulable(clock.time())] == [
         task.id for task in tasks[1:]
     ]
