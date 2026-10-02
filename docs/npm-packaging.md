@@ -3,14 +3,17 @@
 The npm package bundles the Python source from the same checkout and exposes
 `nanodot` through a Node launcher. It has no npm dependencies or installation
 hooks; installation also works with `--ignore-scripts`. Runtime preparation
-happens on the first command that needs it.
+happens on the first command that needs it. The bundled CLI is standard-library
+only — `pyproject.toml` declares no runtime Python dependencies — so the
+package ships the `.py` sources and needs no `pip install` step at run time.
 
 The launcher reuses Python 3.11+ from PATH or downloads Python 3.12 using uv's
 official installer, pinned to uv 0.12.21. uv and Python are stored in nanodot's
 runtime cache. The unmanaged installer and `--no-bin` Python installation keep
 setup from changing shell profiles or creating global Python commands.
-The CLI receives the original arguments, working directory, environment,
-signals and exit status. Its background runner inherits the bundled source path.
+The download step requires `curl` on PATH. The CLI receives the original
+arguments, working directory, environment, signals and exit status. Its
+background runner inherits the bundled source path.
 
 ## Validate and try a package
 
