@@ -48,10 +48,16 @@ try {
   const python = found.stdout.trim();
   // Verify TLS trust in the downloaded runtime, needed for the public PR watcher.
   invoke(python, ['-c', [
+    'from urllib.error import HTTPError',
     'from urllib.request import Request, urlopen',
     'request = Request("https://api.github.com/repos/ThinkFlowLab/nanodot",',
     '                  headers={"User-Agent": "nanodot-npm-smoke", "Accept": "application/vnd.github+json"})',
-    'with urlopen(request, timeout=30) as response: assert response.status == 200',
+    'try:',
+    '    with urlopen(request, timeout=30) as response: assert response.status == 200',
+    'except HTTPError:',
+    '    # An HTTP response verifies TLS even when anonymous API quota is exhausted.',
+    '    # Certificate and connection failures are URLError, and still fail this check.',
+    '    pass',
   ].join('\n')]);
   console.log('PASS real runtime download, cached restart, clean stdout and public GitHub TLS');
 } finally {
