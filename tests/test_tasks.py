@@ -148,3 +148,14 @@ def test_secrets_never_persist_in_task_text(home: Path) -> None:
     assert secret not in loaded.purpose
     assert secret not in loaded.notification_conditions
     assert secret not in (loaded.blocker or "")
+
+
+def test_created_task_without_schedule_is_immediately_schedulable(home: Path) -> None:
+    from fakes import FakeClock
+
+    clock = FakeClock()
+    store = TaskStore(clock=clock)
+    task = store.create(Task(target=PRTarget.parse("o/r#1"), purpose="watch"))
+
+    assert task.next_check_at == clock.time()
+    assert [t.id for t in store.list_schedulable(clock.time())] == [task.id]

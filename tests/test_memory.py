@@ -289,3 +289,45 @@ def test_cli_memory_roundtrip(home: Path, capsys) -> None:
     assert "one-line summaries" in capsys.readouterr().out
     assert main(["memory", "rm", item_id]) == 0
     assert main(["memory", "show", item_id]) == 1
+
+
+def test_relevant_to_matches_recorded_pr_identity(home: Path) -> None:
+    store = MemoryStore()
+    # Runner-recorded observations embed the target as 'owner/repo#12: ...'.
+    observation = store.add_observation(
+        "thinkflowlab/nanodot#12: required checks passed",
+        task_id="task-1",
+        evidence_ref="activity:1",
+    )
+
+    hits = store.relevant_to("thinkflowlab/nanodot#12 ping me when done")
+    assert [item.id for item in hits] == [observation.id]
+
+    unrelated = store.add_user("prefer short summaries")
+    assert unrelated.id not in [item.id for item in store.relevant_to(
+        "thinkflowlab/nanodot#12 ping me when done")]
+
+
+def test_empty_memory_content_is_rejected(home: Path) -> None:
+    store = MemoryStore()
+    for content in ("", "   "):
+        with pytest.raises(ValueError, match="must not be empty"):
+            store.add_user(content)
+        with pytest.raises(ValueError, match="must not be empty"):
+            store.propose(content)
+    item = store.add_user("real content")
+    with pytest.raises(ValueError, match="must not be empty"):
+        store.edit(item.id, "")
+    assert store.count() == 1
+
+
+def test_memory_list_reports_hidden_older_items(home: Path, capsys) -> None:
+    from nanodot.cli import main
+
+    for index in range(202):
+        assert main(["memory", "add", f"preference number {index:03d}"]) == 0
+    capsys.readouterr()
+    assert main(["memory", "list"]) == 0
+    out = capsys.readouterr().out
+    assert "preference number 201" in out
+    assert "... and 2 older item(s) not shown" in out

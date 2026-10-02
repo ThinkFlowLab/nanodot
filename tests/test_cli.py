@@ -159,3 +159,114 @@ def test_start_status_stop_roundtrip(
         time.sleep(0.3)
     assert main(["status"]) == 1
     capsys.readouterr()
+
+
+def _corrupt_config(home: Path, text: str) -> None:
+    home.mkdir(parents=True, exist_ok=True)
+    (home / "config.json").write_text(text)
+
+
+def test_config_list_survives_invalid_stored_value(
+    home: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _corrupt_config(home, '{"os-notifications": "off"}')
+    assert main(["config", "list"]) == 0
+    out = capsys.readouterr().out
+    assert "os-notifications=<invalid:" in out
+    assert "must be true or false" in out
+
+
+def test_config_list_fails_cleanly_on_truncated_json(
+    home: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _corrupt_config(home, '{"os-notifications": tru')
+    assert main(["config", "list"]) == 1
+    assert "error:" in capsys.readouterr().err
+
+
+def test_config_unset_fails_cleanly_on_non_object_config(
+    home: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _corrupt_config(home, "[]")
+    assert main(["config", "unset", "github-auth-mode"]) == 1
+    assert "JSON object" in capsys.readouterr().err
+
+
+def test_watch_add_reports_unusable_secret_store_cleanly(
+    home: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    home.mkdir(parents=True, exist_ok=True)
+    victim = home.parent / "outside-secrets.json"
+    victim.write_text("{}")
+    (home / "secrets.json").symlink_to(victim)
+    assert main(["watch", "add", TARGET, "--yes"]) == 1
+    assert "regular file" in capsys.readouterr().err
+    assert victim.read_text() == "{}"
+
+
+def test_config_set_secret_reports_unusable_secret_store_cleanly(
+    home: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    home.mkdir(parents=True, exist_ok=True)
+    victim = home.parent / "outside-token.json"
+    victim.write_text("{}")
+    (home / "secrets.json").symlink_to(victim)
+    assert main(["config", "set", "github-token", "ghp_whatever"]) == 1
+    assert "regular file" in capsys.readouterr().err
+
+
+def test_watch_add_confirmation_declines_on_eof_stdin(
+    home: Path, token: str, capsys: pytest.CaptureFixture[str]
+) -> None:
+    with mock.patch("builtins.input", side_effect=EOFError):
+        assert main(["watch", "add", TARGET]) == 1
+    assert "cancelled" in capsys.readouterr().out
+    assert TaskStore().list() == []
+
+
+def test_concurrent_config_and_secret_writes_keep_all_keys(home: Path) -> None:
+    import threading
+
+    from nanodot.core.config import Config
+
+    home.mkdir(parents=True, exist_ok=True)
+    Config().set("github-auth-mode", "anonymous")
+    errors: list[Exception] = []
+
+    def config_writer(index: int) -> None:
+        try:
+            for round_index in range(25):
+                Config().set(f"key-{index}", f"value-{round_index}")
+        except Exception as error:  # pragma: no cover - surfaced via assert
+            errors.append(error)
+
+    def secret_writer(index: int) -> None:
+        try:
+            for round_index in range(25):
+                FileSecretStore().set(f"secret-{index}", f"value-{round_index}")
+        except Exception as error:  # pragma: no cover - surfaced via assert
+            errors.append(error)
+
+    def reader() -> None:
+        try:
+            for _ in range(200):
+                Config().get("github-auth-mode")  # never a partial file
+        except Exception as error:
+            errors.append(error)
+
+    threads = [threading.Thread(target=config_writer, args=(i,)) for i in range(4)]
+    threads += [threading.Thread(target=secret_writer, args=(i,)) for i in range(4)]
+    threads += [threading.Thread(target=reader) for _ in range(2)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    assert errors == []
+    final = Config()
+    assert final.get("github-auth-mode") == "anonymous"
+    for index in range(4):
+        assert final.get(f"key-{index}") is not None
+    store = FileSecretStore()
+    for index in range(4):
+        assert store.get(f"secret-{index}") is not None

@@ -207,3 +207,36 @@ def test_stopped_tick_does_not_attempt_due_tasks(home: Path) -> None:
     # Omitting the stop event preserves the existing one-pass API.
     assert daemon.tick() == 1
     assert github.fetch_calls == 1
+
+
+def test_store_iteration_failure_costs_one_pass_not_the_daemon(
+    home: Path, caplog: pytest.LogCaptureFixture,
+) -> None:
+    clock = FakeClock()
+    store = TaskStore(clock=clock)
+    task = store.create(
+        Task(target=PRTarget.parse("o/r#1"), purpose="watch", next_check_at=0)
+    )
+    github = FakeGitHub(task.target)
+    daemon = RunnerDaemon(
+        TaskLoop(store, github, FakeSink(), ActivityLog()), store, clock=clock
+    )
+    real_list = store.list_schedulable
+    broken = True
+
+    def racing_list(now):
+        # A transient failure outside the per-task guard (for example a
+        # secret-rotation race surfacing through task validation).
+        if broken:
+            raise OSError("secret store changed while being opened")
+        return real_list(now)
+
+    store.list_schedulable = racing_list  # type: ignore[method-assign]
+    with caplog.at_level("WARNING"):
+        assert daemon.tick() == 0
+    assert "task listing failed" in caplog.text
+    assert github.fetch_calls == 0
+
+    broken = False
+    assert daemon.tick() == 1
+    assert github.fetch_calls == 1

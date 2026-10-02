@@ -528,6 +528,7 @@ def test_suite_rerequest_during_fetch_retries(monkeypatch) -> None:
 
 
 @pytest.mark.parametrize("event,expected", [("push", CheckOutcome.PASSING), ("pull_request", CheckOutcome.PASSING),
+                                            ("workflow_call", CheckOutcome.PASSING),
                                             ("workflow_dispatch", CheckOutcome.PENDING)])
 def test_actions_workflow_must_be_eligible_for_required_pr_checks(monkeypatch, event, expected) -> None:
     workflow = {"id": 5, "check_suite_id": 1, "head_sha": "abc123", "event": event, "status": COMPLETED}
@@ -690,13 +691,25 @@ def test_check_or_status_read_failure_never_returns_partial_success(monkeypatch,
         _fetch(monkeypatch, override=override)
 
 
-@pytest.mark.parametrize("code", [301, 302, 303, 307, 308])
-def test_rejected_redirect_is_a_fetch_error(monkeypatch, code) -> None:
+@pytest.mark.parametrize("code", [302, 303, 307])
+def test_rejected_temporary_redirect_is_a_fetch_error(monkeypatch, code) -> None:
     def handler(request):
         raise HTTPError(request.full_url, code, "redirect rejected",
                         {"Location": "https://untrusted.example/path"}, io.BytesIO(b""))
     calls = _patch_urlopen(monkeypatch, handler)
     with pytest.raises(UnexpectedStatusError, match=f"GitHub error {code}"):
+        GitHubSnapshotFetcher(token="tok").fetch(TARGET)
+    assert len(calls) == 1
+
+
+@pytest.mark.parametrize("code", [301, 308])
+def test_rejected_permanent_redirect_blocks_instead_of_retrying(monkeypatch, code) -> None:
+    def handler(request):
+        raise HTTPError(request.full_url, code, "redirect rejected",
+                        {"Location": "https://untrusted.example/path"}, io.BytesIO(b""))
+    calls = _patch_urlopen(monkeypatch, handler)
+    # A renamed owner/repo answers 301 forever; retrying it can never succeed.
+    with pytest.raises(PRNotFoundError, match="permanently"):
         GitHubSnapshotFetcher(token="tok").fetch(TARGET)
     assert len(calls) == 1
 
@@ -739,3 +752,33 @@ def test_malformed_workflow_suite_identity_never_passes(monkeypatch) -> None:
     workflow = {"id": 5, "check_suite_id": True, "head_sha": "abc123", "event": "push", "status": COMPLETED}
     snap, _ = _fetch(monkeypatch, suites=[_suite(slug="github-actions")], workflows=[workflow])
     assert evaluate_checks(snap) is CheckOutcome.PENDING
+
+
+def test_truncated_body_is_retryable_not_untyped(monkeypatch) -> None:
+    import http.client
+
+    class _Truncated(io.BytesIO):
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def read(self, *args):
+            raise http.client.IncompleteRead(b"{partial")
+
+    _patch_urlopen(monkeypatch, lambda request: _Truncated(b""))
+    with pytest.raises(RetryableError, match="network error"):
+        GitHubSnapshotFetcher(token="tok").fetch(TARGET)
+
+
+def test_local_secret_store_failure_is_a_blocker_not_github_data(monkeypatch, tmp_path) -> None:
+    home = tmp_path / "nanodot-home"
+    home.mkdir()
+    monkeypatch.setenv("NANODOT_HOME", str(home))
+    victim = tmp_path / "outside.json"
+    victim.write_text("{}")
+    (home / "secrets.json").symlink_to(victim)
+
+    with pytest.raises(AuthLostError, match="local secret store unusable"):
+        GitHubSnapshotFetcher().fetch(TARGET)
