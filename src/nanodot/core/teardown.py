@@ -13,7 +13,12 @@ from collections.abc import Callable
 
 
 class Teardown:
-    """Collect disposers as resources are built; unwind them on stop."""
+    """Collect disposers as resources are built; unwind them on stop.
+
+    Not thread-safe: register from the orchestrating thread that will
+    later call run — the same thread in the native runner, and the
+    contract an adapter host must keep.
+    """
 
     def __init__(self) -> None:
         self._disposers: list[tuple[str, Callable[[], None]]] = []
