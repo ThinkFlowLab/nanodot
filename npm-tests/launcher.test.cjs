@@ -124,7 +124,7 @@ test('existing Python preserves literal arguments, data home, cwd and CLI exit s
   const call = JSON.parse(fs.readFileSync(path.join(f.root, 'app.jsonl')));
   assert.deepEqual(call.args.slice(3), args);
   assert.equal(call.args[2], SOURCE);
-  assert.equal(call.cwd, f.caller);
+  assert.equal(call.cwd, fs.realpathSync(f.caller));
   assert.equal(call.dataHome, f.env.NANODOT_HOME);
   assert.equal(call.pythonpath, SOURCE + path.delimiter + 'original-pythonpath');
   assert.equal(f.count('downloads'), 0);
