@@ -33,9 +33,9 @@ the machinery. These bind any future adapter (DSH, openJiuwen, or other):
    schema. Boot validates the declaration and fails loudly before any task
    state is read or written.
 2. **Registrations are effects.** Every lock, sink, listener, or daemon a
-   registration creates returns a disposer; shutdown runs disposers in
-   reverse order. Unload leaves no residue — no stale lifetime locks, no
-   orphaned notifications (#37).
+   registration creates registers a disposer with a teardown registry;
+   shutdown runs the disposers in reverse registration order. Unload leaves
+   no residue — no stale lifetime locks, no orphaned notifications (#37).
 3. **Provider-visible implies logged.** Nothing reaches an inference
    provider that cannot be reconstructed from the activity log. EgressGuard
    makes this structural; the egress tripwire test makes it checked. A new
