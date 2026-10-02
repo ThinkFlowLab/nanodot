@@ -19,19 +19,8 @@ git clone https://github.com/ThinkFlowLab/nanodot.git
 cd nanodot
 ```
 
-Choose the version you want to install **before** creating the environment:
-
-| Checkout | Available functionality |
-| --- | --- |
-| `main` (the default clone) | CLI scaffold: help and version output. |
-| `integration/mvp-first-pr-watch` | PR watching, runner, inbox, activity, memory, and optional inference. |
-
-The full MVP is currently in [PR #28](https://github.com/ThinkFlowLab/nanodot/pull/28).
-To follow the [user guide](user-guide.md), switch to that branch:
-
-```sh
-git switch integration/mvp-first-pr-watch
-```
+The default `main` branch includes the full PR-watch MVP: PR watching,
+runner, inbox, activity, memory, and optional inference.
 
 Then create and activate the environment, and install nanodot:
 
@@ -60,9 +49,9 @@ nanodot --help
 The version command prints `nanodot 0.1.0`. Help shows the commands available
 in the installed checkout.
 
-If help only lists `--help` and `--version`, you installed the `main` scaffold.
-To use the MVP commands, switch to the integration branch above and rerun
-`python -m pip install -e .`.
+If the watch or memory commands are missing, update the checkout
+(`git pull`) and rerun `python -m pip install -e .`; older checkouts
+predate the MVP merge.
 
 Next, follow the [user guide](user-guide.md). The MVP's offline demonstration
 does not need a GitHub token, a model, or network access after installation.

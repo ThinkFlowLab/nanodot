@@ -1,10 +1,7 @@
 # User guide
 
-This guide covers the PR-watch MVP in
-[PR #28](https://github.com/ThinkFlowLab/nanodot/pull/28). Until it is merged,
-install `integration/mvp-first-pr-watch` using the
-[installation guide](installation.md). The current `main` checkout only
-supports `nanodot --help` and `nanodot --version`.
+This guide covers the PR-watch MVP on the default `main` branch. Set it up
+with the [installation guide](installation.md); no branch switching is needed.
 
 The MVP watches GitHub pull requests, keeps a local notification inbox and
 activity history, and stores memory you can inspect and edit. It runs on Linux
@@ -12,7 +9,7 @@ and macOS. A model is optional; the normal PR-watch workflow works without one.
 
 ## Try it offline first
 
-With your virtual environment active, run this from the MVP checkout:
+With your virtual environment active, run this from the checkout:
 
 ```sh
 python examples/first_pr_watch.py
@@ -26,7 +23,7 @@ restart recovery, cancellation, and background runner shutdown.
 The final output should include `8 scenarios passed` and the directory holding
 the report and command transcript. It leaves your normal nanodot data alone and
 stops its runner. See the
-[detailed walkthrough](https://github.com/ThinkFlowLab/nanodot/blob/integration/mvp-first-pr-watch/docs/first-pr-watch.md)
+[detailed walkthrough](first-pr-watch.md)
 for the individual scenarios.
 
 ## Choose where to keep your data
@@ -252,7 +249,7 @@ not enable arbitrary watch conditions or external writes.
 
 Your explicit intent text and selected PR/check metadata can be sent to this
 provider. Stored memory and local activity history are not included. Read the
-[egress contract](https://github.com/ThinkFlowLab/nanodot/blob/integration/mvp-first-pr-watch/docs/design/egress.md)
+[egress contract](design/egress.md)
 before enabling it. To disable inference, run `nanodot config unset api-key`.
 
 ## Permissions
@@ -270,7 +267,7 @@ be enabled.
 
 | Symptom | Next step |
 | --- | --- |
-| `watch` or `memory` is an unrecognized command | Check `git branch --show-current` and follow the MVP branch steps in the [installation guide](installation.md). |
+| `watch` or `memory` is an unrecognized command | Update the checkout (`git pull`) and reinstall as described in the [installation guide](installation.md). |
 | `no GitHub token configured` | Select `anonymous` for public PRs, or save a read-only token for token mode. |
 | Watch is blocked after token/access loss | Repair repository access, inspect `watch show TASK_ID`, then run `watch resume TASK_ID`. |
 | CI looks green but the watch remains active | Inspect `activity TASK_ID`; required rules may be hidden, empty, missing, or unsupported. |
