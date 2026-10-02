@@ -220,6 +220,10 @@ class TaskStore:
 
     def create(self, task: Task) -> Task:
         self.validate(task)
+        if task.next_check_at is None:
+            # SQL `NULL <= now` is never true: persisted without a schedule,
+            # an ACTIVE task would silently never be fetched.
+            task.next_check_at = self._time.time()
         try:
             with self._lock, self._conn:
                 self._conn.execute(

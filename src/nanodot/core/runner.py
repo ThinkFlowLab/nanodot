@@ -30,6 +30,7 @@ from nanodot.ports.notifier import NotificationSink
 MAX_BACKOFF_SECONDS = 3600
 PROLONGED_FAILURE_SECONDS = 3600
 SUMMARY_BUDGET_SECONDS = 1.0
+CHECK_OBSERVED = "check-observed"  # per-poll record of what the runner saw
 
 
 def state_change_from_event(event: WatchEvent) -> StateChange:
@@ -186,6 +187,24 @@ class TaskLoop:
             return RunOutcome.SKIPPED_SCOPE_CHANGED
         return None
 
+    def _record(
+        self, task_id: str, kind: str, message: str,
+        evidence: dict | None, at: float,
+    ) -> None:
+        """Append to the activity log without failing the run: task state
+        and delivery never depend on the log accepting an entry."""
+        try:
+            self._activity.append(
+                task_id=task_id, kind=kind, message=message,
+                evidence=evidence, at=at,
+            )
+        except Exception:
+            # Do not log exception text; it may include private contents.
+            logging.getLogger(__name__).warning(
+                "task %s: %s entry could not be saved to the activity log",
+                task_id, kind,
+            )
+
     def _run_locked(self, task: Task, now: float) -> RunOutcome:
         try:
             snapshot = self._fetcher.fetch(task.target)
@@ -216,25 +235,35 @@ class TaskLoop:
         watch_state, events = statemachine.step(task, snapshot, now)
         task.watch_state = watch_state
 
-        for event in events:
+        for index, event in enumerate(events):
             if event.notable and self._provider is not None:
                 summary = self._summaries.summarize(self._provider, event)
                 if summary:
-                    event = replace(event, summary=summary)
-            if skipped := self._superseded(task):
-                return skipped
-            self._activity.append(
-                task_id=task.id,
-                kind=event.kind,
-                message=event.message,
-                evidence=event.evidence,
-                at=event.at,
+                    events[index] = replace(event, summary=summary)
+
+        # A pause/cancel/scope edit during fetching or summarizing takes
+        # effect before anything is recorded or delivered: a superseded run
+        # leaves no activity entries at all.
+        if skipped := self._superseded(task):
+            return skipped
+
+        # Observe → decide → act: every poll records what it saw before the
+        # events it produced, so the log alone replays every decision.
+        self._record(
+            task.id,
+            CHECK_OBSERVED,
+            f"observed {snapshot.head_sha[:10]} ({snapshot.pr_state})",
+            statemachine.observation(snapshot),
+            now,
+        )
+
+        for event in events:
+            self._record(
+                task.id, event.kind, event.message, event.evidence, event.at
             )
             if event.notable:
                 self._sink.notify(event)
 
-        if skipped := self._superseded(task):
-            return skipped
         terminal = any(event.terminal for event in events)
         if terminal:
             terminal_event = next(e for e in events if e.terminal)

@@ -110,6 +110,7 @@ class ActivityLog:
         self,
         task_id: str | None = None,
         kinds: tuple[str, ...] | None = None,
+        exclude_kinds: tuple[str, ...] | None = None,
         limit: int = 100,
     ) -> list[ActivityEntry]:
         clauses, params = [], []
@@ -119,11 +120,16 @@ class ActivityLog:
         if kinds:
             clauses.append(f"kind IN ({','.join('?' * len(kinds))})")
             params.extend(kinds)
+        if exclude_kinds:
+            clauses.append(f"kind NOT IN ({','.join('?' * len(exclude_kinds))})")
+            params.extend(exclude_kinds)
         where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
         params.append(limit)
         with self._lock:
+            # rowid breaks ties by insertion order: entries written at the
+            # same second replay as observe → decide → act.
             rows = self._conn.execute(
-                f"SELECT * FROM activity {where} ORDER BY at DESC, id LIMIT ?",
+                f"SELECT * FROM activity {where} ORDER BY at DESC, rowid DESC LIMIT ?",
                 params,
             ).fetchall()
         return [

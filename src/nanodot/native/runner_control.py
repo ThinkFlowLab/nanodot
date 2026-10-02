@@ -215,8 +215,11 @@ def stop_runner(pidfile: Path, timeout: float = 5.0) -> bool:
     This function deliberately never sends an OS signal to a stored PID.
     """
     timeout = max(0.0, timeout)
-    deadline = time.monotonic() + timeout
     with startup_lock(pidfile, timeout=timeout):
+        # Start the cooperative-stop window only once startup serialization
+        # is done: time spent queued behind another start/stop command must
+        # not be deducted from the runner's actual stop budget.
+        deadline = time.monotonic() + timeout
         with _open_lock(_lock_path(pidfile)) as handle:
             if _try_lock(handle):
                 pidfile.unlink(missing_ok=True)

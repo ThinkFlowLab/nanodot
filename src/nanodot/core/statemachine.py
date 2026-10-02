@@ -7,6 +7,10 @@ and notification sink. All of the issue-#1 safety rules live here:
 - a new head SHA resets evaluation — old results never carry over;
 - unchanged snapshots emit nothing (dedup);
 - every terminal path emits exactly one terminal event.
+
+Every event's evidence names the policy rule that produced it, and
+`observation()` returns the commit-pinned digest a poll saw — together the
+activity log can replay every decision without re-asking GitHub.
 """
 
 from __future__ import annotations
@@ -83,13 +87,21 @@ def _checks_evidence(snapshot: Snapshot) -> dict:
     }
 
 
+def observation(snapshot: Snapshot) -> dict:
+    """What one poll saw: the commit-pinned snapshot digest, plus the
+    fingerprint that dedup keys on. Recorded every poll by the runner so a
+    no-change poll is reconstructable and any decision is replayable from
+    the log alone. Same whitelisted shape as event evidence."""
+    return {"fingerprint": _fingerprint(snapshot), **_checks_evidence(snapshot)}
+
+
 def _event(
-    kind: str, task: Task, snapshot: Snapshot, now: float, message: str
+    kind: str, task: Task, snapshot: Snapshot, now: float, message: str, rule: str
 ) -> WatchEvent:
     return WatchEvent(
         kind=kind,
         message=message,
-        evidence=_checks_evidence(snapshot),
+        evidence={**_checks_evidence(snapshot), "rule": rule},
         terminal=kind in TERMINAL_KINDS,
         notable=kind in NOTABLE_KINDS,
         task_id=task.id,
@@ -132,13 +144,19 @@ def step(task: Task, snapshot: Snapshot, now: float) -> tuple[dict, list[WatchEv
     # Terminal: the PR itself merged or closed — outranks check state.
     if snapshot.pr_state == "merged":
         events.append(
-            _event(PR_MERGED, task, snapshot, now, f"{task.target} was merged")
+            _event(
+                PR_MERGED, task, snapshot, now,
+                f"{task.target} was merged", "stop: pr merged",
+            )
         )
         state.update(terminal=True, terminal_kind=PR_MERGED, last_fingerprint=_fingerprint(snapshot))
         return _finish(state, events)
     if snapshot.pr_state == "closed":
         events.append(
-            _event(PR_CLOSED, task, snapshot, now, f"{task.target} was closed")
+            _event(
+                PR_CLOSED, task, snapshot, now,
+                f"{task.target} was closed", "stop: pr closed",
+            )
         )
         state.update(terminal=True, terminal_kind=PR_CLOSED, last_fingerprint=_fingerprint(snapshot))
         return _finish(state, events)
@@ -153,7 +171,7 @@ def step(task: Task, snapshot: Snapshot, now: float) -> tuple[dict, list[WatchEv
                 kind=NEW_COMMIT,
                 message=f"new commit {snapshot.head_sha[:10]} on {task.target}; "
                 "previous results no longer apply",
-                evidence=evidence,
+                evidence={**evidence, "rule": "notify: new commit resets prior results"},
                 notable=True,
                 task_id=task.id,
                 at=now,
@@ -171,6 +189,7 @@ def step(task: Task, snapshot: Snapshot, now: float) -> tuple[dict, list[WatchEv
                 snapshot,
                 now,
                 f"required checks passed on {snapshot.head_sha[:10]} for {task.target}",
+                "stop: required checks passed on the current head",
             )
         )
         state.update(terminal=True, terminal_kind=CHECKS_PASSED)
@@ -188,6 +207,7 @@ def step(task: Task, snapshot: Snapshot, now: float) -> tuple[dict, list[WatchEv
                     now,
                     f"checks failing on {snapshot.head_sha[:10]} for {task.target}: "
                     + ", ".join(failing),
+                    "notify: checks failing on the current commit",
                 )
             )
     else:  # PENDING or NO_CHECKS — intermediate polls, recorded not notified
@@ -210,7 +230,11 @@ def step(task: Task, snapshot: Snapshot, now: float) -> tuple[dict, list[WatchEv
                 WatchEvent(
                     kind=CHECKS_PENDING,
                     message=pending_message + f" ({task.target})",
-                    evidence=evidence,
+                    evidence={
+                        **evidence,
+                        "rule": "record: success not confirmable",
+                        "pending_reason": pending_message,
+                    },
                     notable=False,
                     task_id=task.id,
                     at=now,

@@ -283,3 +283,43 @@ with RunnerLease(Path(sys.argv[1]), stop):
         if process.poll() is None:
             process.terminate()
         process.communicate(timeout=5)
+
+
+def test_stop_window_starts_after_startup_serialization(tmp_path: Path) -> None:
+    """Time queued behind the start lock is not deducted from the stop budget.
+
+    A stop queued 0.6s behind the startup lock with a 0.5s graceful shutdown
+    fits the fresh 1s window this fix guarantees, but exceeds a deadline
+    computed before the lock was acquired.
+    """
+    pidfile = tmp_path / "runner.pid"
+    stop = threading.Event()
+    released = threading.Event()
+
+    def hold_lease() -> None:
+        with RunnerLease(pidfile, stop):
+            released.set()
+            stop.wait()  # the cooperative request is what stops us
+            time.sleep(0.5)  # graceful shutdown takes a moment
+
+    lease_thread = threading.Thread(target=hold_lease)
+    lease_thread.start()
+    assert released.wait(timeout=5), "lease never acquired the lifetime lock"
+
+    results: list[bool] = []
+    errors: list[Exception] = []
+
+    def stopper() -> None:
+        try:
+            results.append(stop_runner(pidfile, timeout=1.0))
+        except Exception as error:
+            errors.append(error)
+
+    with startup_lock(pidfile):
+        thread = threading.Thread(target=stopper)
+        thread.start()
+        time.sleep(0.6)  # queued behind startup serialization
+    thread.join(timeout=5)
+    lease_thread.join(timeout=5)
+    assert errors == []
+    assert results == [True]

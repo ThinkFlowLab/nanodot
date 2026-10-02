@@ -233,3 +233,25 @@ def test_failure_notification_names_only_latest_current_failures(required) -> No
     _, events = step(make_task(), snap, now=1000.0)
     assert [event.kind for event in events] == [CHECKS_FAILED]
     assert events[0].message.endswith(": lint")
+
+
+def test_events_carry_rule_provenance() -> None:
+    """Every event names the policy rule that fired (issue #35)."""
+    fake = FakeGitHub(TARGET)
+    ready(fake)
+    fake.add_check("ci", FAILURE, sha="s1")
+    task, events = stepped(fake, make_task())
+    assert events[0].evidence["rule"] == "notify: checks failing on the current commit"
+
+    fake.checks["s1"] = []
+    fake.add_check("ci", None, sha="s1", status=QUEUED)  # re-run after push
+    task, events = stepped(fake, task)
+    pending = events[0]
+    assert pending.kind == CHECKS_PENDING
+    assert pending.evidence["rule"] == "record: success not confirmable"
+    assert "pending" in pending.evidence["pending_reason"]
+
+    fake.checks["s1"] = []
+    fake.add_check("ci", SUCCESS, sha="s1")
+    _, events = stepped(fake, task)
+    assert events[0].evidence["rule"] == "stop: required checks passed on the current head"

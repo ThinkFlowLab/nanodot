@@ -90,6 +90,15 @@ Only one runner may hold a data home's lifetime lock. Shutdown is cooperative;
 a timeout reports that stopping is still pending rather than signaling a saved
 PID or claiming the process exited.
 
+### The activity log is a decision log
+
+Every poll records what the runner observed (`check-observed` entries) before
+any events it produced, and every event's evidence names the policy rule that
+fired (`stop:`, `notify:`, `record:`). A run overtaken by a pause, cancel, or
+scope change records nothing. Replaying the log reproduces every stop/notify
+decision without re-asking GitHub. The default `nanodot activity` view hides
+per-poll observations so events stay readable; pass `--all` to include them.
+
 ### Fixed watch policy
 
 This MVP supports a fixed, validated policy. It notifies on new commits, check

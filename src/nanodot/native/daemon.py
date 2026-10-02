@@ -39,7 +39,16 @@ class RunnerDaemon:
         """
         now = self._clock.time()
         attempted = 0
-        for task in self._store.list_schedulable(now):
+        try:
+            schedulable = self._store.list_schedulable(now)
+        except Exception:
+            # Store iteration runs outside the per-task guard below. A
+            # transient failure (secret rotation race, momentary lock) must
+            # cost this pass, not the daemon; the next tick retries. Never
+            # log exception text: it can contain credentials or private data.
+            logger.warning("task listing failed; will retry next pass")
+            return 0
+        for task in schedulable:
             if stop is not None and stop.is_set():
                 break
             attempted += 1

@@ -299,3 +299,25 @@ def test_cli_runner_wiring_uses_configured_provider(home, monkeypatch):
     assert len(provider.summarize_payloads) == 1
     assert sink.kinds() == [CHECKS_FAILED]
     assert sink.events[0].summary == "A short model summary."
+
+
+def test_truncated_response_body_is_a_provider_error(monkeypatch) -> None:
+    import http.client
+
+    class _Truncated(io.BytesIO):
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def read(self, *args):
+            raise http.client.IncompleteRead(b"{partial")
+
+    monkeypatch.setattr(
+        "nanodot.native.inference_api.authenticated_urlopen",
+        lambda request, timeout=None: _Truncated(b""),
+    )
+    provider = APIInferenceProvider(api_key=API_KEY)
+    with pytest.raises(ProviderError, match="unreachable"):
+        provider.parse_intent("watch owner/repo#1")
