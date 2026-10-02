@@ -183,6 +183,15 @@ processes. This is a test tripwire, not an OS firewall sandbox for arbitrary
 subprocesses. CI applies offline proxy settings to the test step only, after
 checkout, Python setup, and dependency installation.
 
+## Documentation
+
+- [Installation](docs/installation.md): prerequisites, source setup, updates,
+  development setup, and installation troubleshooting.
+- [User guide](docs/user-guide.md): authentication, first PR watch, runner,
+  notifications, task management, memory, optional models, and troubleshooting.
+- [First-use walkthrough](docs/first-pr-watch.md): the full watch lifecycle,
+  background runner, cancellation, and verification details.
+
 See [adapter contracts](docs/design/adapter-seam.md) for dependency direction and
 [the safety/validation review](docs/design/safety-validation.md) for the review
 coverage and integration plan.
