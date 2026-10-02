@@ -335,7 +335,8 @@ def _run_watch(args: argparse.Namespace) -> int:
         except TaskError as error:
             print(f"error: {error}", file=sys.stderr)
             return 1
-        print(f"{args.watch_command}d {task.id} ({task.target})")
+        past_tense = {"pause": "paused", "resume": "resumed", "cancel": "cancelled"}
+        print(f"{past_tense[args.watch_command]} {task.id} ({task.target})")
         return 0
 
     if args.watch_command == "list":

@@ -80,10 +80,14 @@ def test_pause_resume_cancel_take_effect(
     task_id = TaskStore().list()[0].id
 
     assert main(["watch", "pause", task_id]) == 0
+    assert f"paused {task_id}" in capsys.readouterr().out
     assert TaskStore().get(task_id).state.value == "paused"
     assert main(["watch", "resume", task_id]) == 0
+    assert f"resumed {task_id}" in capsys.readouterr().out
     assert TaskStore().get(task_id).state.value == "active"
     assert main(["watch", "cancel", task_id]) == 0
+    out = capsys.readouterr().out
+    assert f"cancelled {task_id}" in out and "canceld" not in out
     assert TaskStore().get(task_id).state.value == "cancelled"
     assert main(["watch", "pause", "no-such-id"]) == 1
 
