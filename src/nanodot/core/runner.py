@@ -97,6 +97,15 @@ class _SummaryBudget:
             return None
         return result[0] if result else None
 
+    def drain(self, seconds: float) -> None:
+        """Wait, bounded by ``seconds``, for an in-flight summary to finish.
+
+        A provider that will not finish costs the wait, not the shutdown:
+        the drain gives up and the summary is abandoned mid-flight.
+        """
+        if self._inflight.acquire(timeout=max(0.0, seconds)):
+            self._inflight.release()
+
 
 class RunOutcome(str, Enum):
     OK = "ok"
@@ -131,6 +140,7 @@ class TaskLoop:
         self._activity = activity
         self._provider = provider
         self._memory = memory
+        self._summary_budget_seconds = summary_budget_seconds
         self._summaries = _SummaryBudget(summary_budget_seconds)
         self._locks: dict[str, threading.Lock] = {}
         self._locks_guard = threading.Lock()
@@ -138,6 +148,17 @@ class TaskLoop:
     def _lock_for(self, task_id: str) -> threading.Lock:
         with self._locks_guard:
             return self._locks.setdefault(task_id, threading.Lock())
+
+    def close(self) -> None:
+        """Release the loop's own resources: drain an in-flight summary
+        (bounded by the summary budget) and drop the per-task locks.
+
+        Call after serve/tick has returned. Safe to call more than once;
+        a later run_once rebuilds whatever it needs.
+        """
+        self._summaries.drain(self._summary_budget_seconds)
+        with self._locks_guard:
+            self._locks.clear()
 
     def run_once(self, task: Task, now: float) -> RunOutcome:
         """One bounded check for one task. Safe to call concurrently:
