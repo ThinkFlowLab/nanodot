@@ -170,6 +170,14 @@ notification fires (days idle, PR state, head, checks). A new commit re-arms
 it; terminal, failing, paused, or cancelled ticks never alert. Composes
 freely with `--digest`.
 
+### Flaky alerts
+
+`watch add --flaky` notifies when a check flips between red and green on the
+same commit — whether the rerun is visible within one poll or across polls.
+Each flip is one notification (distinct occurrences, so flapping stays
+visible); non-definitive states never count; a new commit resets. Composes
+freely with `--digest` and `--stale`.
+
 ### Fixed watch policy
 
 This MVP supports a fixed, validated policy. It notifies on new commits, check

@@ -35,7 +35,7 @@ COMPLETED = "completed"
 class FakeGitHub(SnapshotFetcher):
     """Scriptable GitHub: set PR state, per-SHA check runs, or errors."""
 
-    def __init__(self, target: PRTarget) -> None:
+    def __init__(self, target: PRTarget, required: tuple[RequiredCheck, ...] | None = None) -> None:
         self.target = target
         self.pr_state = "open"
         self.head_sha = "sha-1"
@@ -43,6 +43,9 @@ class FakeGitHub(SnapshotFetcher):
         self.error: Exception | None = None
         self.fetch_calls = 0
         self.rate_limit_remaining: int | None = None
+        # None: derive from head checks (the historical default); an explicit
+        # tuple (e.g. ()) lets tests decouple flips from required-check logic.
+        self.required_override = required
 
     def set_pr(self, state: str, head_sha: str | None = None) -> None:
         self.pr_state = state
@@ -72,9 +75,13 @@ class FakeGitHub(SnapshotFetcher):
                 if sha != self.head_sha
                 for run in runs
             ),
-            required_checks=tuple(
-                RequiredCheck(name=run.name)
-                for run in self.checks.get(self.head_sha, ())
+            required_checks=(
+                self.required_override
+                if self.required_override is not None
+                else tuple(
+                    RequiredCheck(name=run.name)
+                    for run in self.checks.get(self.head_sha, ())
+                )
             ),
             checks_complete=True,
             rate_limit_remaining=self.rate_limit_remaining,
