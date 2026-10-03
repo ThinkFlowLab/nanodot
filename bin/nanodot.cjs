@@ -4,10 +4,10 @@
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
+const { createHash } = require('node:crypto');
 const { spawn, spawnSync } = require('node:child_process');
 
-const UV_VERSION = '0.12.21';
-const INSTALLER_URL = `https://astral.sh/uv/${UV_VERSION}/install.sh`;
+const MANIFEST = require('./uv-manifest.json');
 const SOURCE = path.resolve(__dirname, '..', 'src');
 const PYTHON_PROBE = 'import sys\nif sys.version_info < (3, 11): raise SystemExit(1)\nprint(sys.executable)';
 
@@ -51,6 +51,55 @@ function managedPython(uv, env) {
   return result.status === 0 ? probePython(result.stdout.trim()) : null;
 }
 
+function assetFor(platform) {
+  const architectures = { arm64: 'arm64', x64: 'x64' };
+  const key = `${platform}-${architectures[process.arch]}`;
+  const asset = MANIFEST.assets[key];
+  if (!asset || !/^[0-9a-f]{64}$/.test(asset.sha256)) {
+    throw new Error(`no pinned uv download for ${key || process.arch} on ${platform}`);
+  }
+  return asset;
+}
+
+function digestOf(file) {
+  return new Promise((resolve, reject) => {
+    const hash = createHash('sha256');
+    const stream = fs.createReadStream(file);
+    stream.on('data', chunk => hash.update(chunk));
+    stream.on('error', reject);
+    stream.on('end', () => resolve(hash.digest('hex')));
+  });
+}
+
+async function installUv(cache, uvDirectory) {
+  const asset = assetFor(process.platform);
+  const url = `${MANIFEST.baseUrl}/${asset.name}`;
+  const temporary = fs.mkdtempSync(path.join(cache, 'setup-'));
+  const archive = path.join(temporary, asset.name);
+  const extracted = path.join(temporary, asset.name.replace(/\.tar\.gz$/, ''));
+  try {
+    await run('curl', ['-q', '--fail', '--location', '--silent', '--show-error',
+      '--connect-timeout', '15', '--max-time', '300', '--output', archive, url]);
+    const actual = await digestOf(archive);
+    if (actual !== asset.sha256) {
+      throw new Error(`integrity check failed for ${asset.name} ` +
+        `(expected ${asset.sha256.slice(0, 12)}…, got ${actual.slice(0, 12)}…)`);
+    }
+    await run('tar', ['-xzf', archive, '-C', temporary]);
+    if (!fs.existsSync(path.join(extracted, 'uv'))) {
+      throw new Error(`uv archive did not contain ${asset.name.replace(/\.tar\.gz$/, '')}/uv`);
+    }
+    // Publish a complete installation; simultaneous first runs can use the winner.
+    try {
+      fs.renameSync(extracted, uvDirectory);
+    } catch (error) {
+      if (!['EEXIST', 'ENOTEMPTY'].includes(error.code)) throw error;
+    }
+  } finally {
+    fs.rmSync(temporary, { recursive: true, force: true });
+  }
+}
+
 async function python() {
   for (const candidate of ['python3', 'python3.12', 'python']) {
     const found = probePython(candidate);
@@ -60,7 +109,7 @@ async function python() {
   const base = process.env.XDG_CACHE_HOME || (process.platform === 'darwin'
     ? path.join(os.homedir(), 'Library', 'Caches') : path.join(os.homedir(), '.cache'));
   const cache = path.join(base, 'nanodot', 'npm');
-  const uvDirectory = path.join(cache, `uv-${UV_VERSION}`);
+  const uvDirectory = path.join(cache, `uv-${MANIFEST.uvVersion}`);
   const uv = path.join(uvDirectory, 'uv');
   const env = {
     ...process.env,
@@ -75,24 +124,7 @@ async function python() {
   console.error('nanodot: Setting up Python for the first run. This requires internet access.');
   fs.mkdirSync(cache, { recursive: true, mode: 0o700 });
   if (!fs.existsSync(uv)) {
-    const temporary = fs.mkdtempSync(path.join(cache, 'setup-'));
-    const installer = path.join(temporary, 'install.sh');
-    const installDirectory = path.join(temporary, 'uv');
-    try {
-      await run('curl', ['-q', '--fail', '--location', '--silent', '--show-error',
-        '--connect-timeout', '15', '--max-time', '120', '--output', installer, INSTALLER_URL]);
-      await run('/bin/sh', [installer], {
-        ...process.env, UV_UNMANAGED_INSTALL: installDirectory, UV_NO_MODIFY_PATH: '1',
-      });
-      // Publish a complete installation; simultaneous first runs can use the winner.
-      try {
-        fs.renameSync(installDirectory, uvDirectory);
-      } catch (error) {
-        if (!['EEXIST', 'ENOTEMPTY'].includes(error.code)) throw error;
-      }
-    } finally {
-      fs.rmSync(temporary, { recursive: true, force: true });
-    }
+    await installUv(cache, uvDirectory);
   }
   await run(uv, ['python', 'install', '--no-bin', '3.12'], env);
   const found = managedPython(uv, env);

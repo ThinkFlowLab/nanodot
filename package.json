@@ -12,6 +12,7 @@
   },
   "files": [
     "bin/nanodot.cjs",
+    "bin/uv-manifest.json",
     "src/nanodot/**/*.py"
   ],
   "engines": {
