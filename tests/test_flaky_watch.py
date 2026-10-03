@@ -177,3 +177,23 @@ def test_migration_and_validation(home: Path) -> None:
     conn.execute("ALTER TABLE tasks DROP COLUMN flaky_alerts")
     conn.commit(); conn.close()
     assert TaskStore(path=h.home / "nanodot.db").get(h.task.id).flaky_alerts is False
+
+
+def test_flip_on_the_completing_poll_fires_alongside_terminal(home: Path) -> None:
+    """Acceptance row: a flip on the poll that completes the watch still
+    fires — orthogonally, not instead of the terminal notification."""
+    from nanodot.core.statemachine import CHECKS_PASSED
+
+    h = Harness(home)
+    h.github.add_check("ci", FAILURE, sha="s1")  # failing first: tracked red
+    h.tick()  # the watch stays active on the failing required check
+    h.github.checks["s1"] = [
+        CheckRun(name="ci", status=COMPLETED, conclusion=SUCCESS, sha="s1", run_id=1)
+    ]
+    outcome = h.tick(advance=300)
+    assert outcome is RunOutcome.TERMINAL  # the watch itself completed
+    assert len(h.flakes()) == 1  # ...and the flip fired in the same poll
+    assert h.store.get(h.task.id).state.value != "active"
+    kinds = [e.kind for e in h.sink.events]
+    assert CHECKS_PASSED in kinds
+    assert FLAKY in kinds
