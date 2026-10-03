@@ -16,6 +16,35 @@ python -m pip install -e '.[dev]'
 nanodot --help
 ```
 
+## Install with npm on macOS or Linux
+
+Requires Node.js 22 or newer. After the first npm release is published:
+
+```sh
+npm install -g nanodot
+nanodot --help
+```
+
+Or run without a global installation:
+
+```sh
+npx nanodot --help
+```
+
+The launcher uses an existing Python 3.11+ when available. Otherwise, its first
+run downloads a private Python runtime automatically. macOS (Intel and Apple
+Silicon) and common Linux distributions (x86_64 and aarch64) are supported.
+Automatic setup needs internet access and `curl`, which is included with macOS
+and common Linux distributions; on minimal container images, install `curl` or
+Python 3.11+ first. Later runs reuse the installed runtime.
+
+Runtime downloads live in `~/Library/Caches/nanodot/npm` on macOS and
+`~/.cache/nanodot/npm` on Linux; `XDG_CACHE_HOME` overrides the cache location.
+Application data uses `~/.nanodot`, or the directory set by `NANODOT_HOME`.
+
+See [npm packaging and release checks](docs/npm-packaging.md) for testing a
+package before publication.
+
 ## First use: watch a public PR
 
 Try the complete offline lifecycle first (no token, model, or network):
@@ -200,6 +229,8 @@ checkout, Python setup, and dependency installation.
   notifications, task management, memory, optional models, and troubleshooting.
 - [First-use walkthrough](docs/first-pr-watch.md): the full watch lifecycle,
   background runner, cancellation, and verification details.
+- [npm packaging](docs/npm-packaging.md): installing via npm on macOS or Linux,
+  and testing a package before publication.
 
 See [adapter contracts](docs/design/adapter-seam.md) for dependency direction and
 [the safety/validation review](docs/design/safety-validation.md) for the review

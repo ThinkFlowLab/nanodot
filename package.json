@@ -1,0 +1,26 @@
+{
+  "name": "nanodot",
+  "version": "0.1.0",
+  "description": "A local-first assistant with persistent memory and a read-only PR watcher",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/ThinkFlowLab/nanodot.git"
+  },
+  "bin": {
+    "nanodot": "bin/nanodot.cjs"
+  },
+  "files": [
+    "bin/nanodot.cjs",
+    "src/nanodot/**/*.py"
+  ],
+  "engines": {
+    "node": ">=22"
+  },
+  "os": ["darwin", "linux"],
+  "scripts": {
+    "test": "node --test npm-tests/*.test.cjs",
+    "test:package": "node npm-tests/package-smoke.cjs",
+    "test:bootstrap": "node npm-tests/bootstrap-smoke.cjs"
+  }
+}
