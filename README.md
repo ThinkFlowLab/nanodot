@@ -128,18 +128,22 @@ scope change records nothing. Replaying the log reproduces every stop/notify
 decision without re-asking GitHub. The default `nanodot activity` view hides
 per-poll observations so events stay readable; pass `--all` to include them.
 
-### Gated writes: proposed, never sent without your approval
+### Writes: auto by default, gated for interactive approval
 
-In addition to the default `readonly` mode, `gated` mode lets the watcher
-propose one external action — a comment on the PR it watches, rule-drafted
-from observed check failures. A proposal lands in the inbox with its exact
-content; nothing is sent until you run `nanodot approvals approve
-<request-id>`. Approval issues a single-use, content-bound capability:
-the bytes at the HTTP boundary must hash-match what you approved, and a
-crash mid-write surfaces as unknown in the inbox and is never blindly
-re-sent. Gated mode requires a separate write token
+The watcher can propose one external action — a comment on the PR it
+watches, rule-drafted from observed check failures. Every write goes
+through a single-use, content-bound capability: the bytes at the HTTP
+boundary must hash-match what was authorized, and a crash mid-write
+surfaces as unknown in the inbox and is never blindly re-sent.
+
+`auto` (the default) never prompts: writes execute only against a
+standing pre-grant you create explicitly; grant-less content is skipped
+and recorded once, nothing sent, nothing asked. `gated` pauses every
+write as a proposal in the inbox until you run `nanodot approvals
+approve <request-id>`. `readonly` is the explicit hard-off — no writes
+are even proposed. All write modes require a separate write token
 (`nanodot config set github-write-token`); the read token never gains
-write reach. `auto` mode does not exist: no standing write grants.
+write reach, and without a write token every mode is inert.
 
 ### Fixed watch policy
 
@@ -208,9 +212,11 @@ removes the item, securely overwrites deleted SQLite cells, and leaves a
 contentless activity tombstone. This is not a promise to erase filesystem
 snapshots, backups, or copies retained outside nanodot.
 
-Only `readonly` mode is implemented. `gated`/`auto` cannot be enabled, and all
-write actions are denied. Grants and approval records remain inspectable;
-scope changes revoke related grants and pending requests atomically.
+All three permission modes are implemented: `auto` (the default;
+standing pre-granted capabilities only, never prompts), `gated`
+(interactive approval per write), and `readonly` (the hard-off). Grants
+and approval records remain inspectable; scope changes revoke related
+grants and pending requests atomically.
 
 Data defaults to `~/.nanodot`; `NANODOT_HOME` selects an isolated directory.
 Secrets are stored in a private `0600` file via atomic replacement with symlink

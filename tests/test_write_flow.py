@@ -29,10 +29,12 @@ from nanodot.core.permissions import (
 from nanodot.core.redaction import Redactor
 from nanodot.core.runner import RunOutcome, TaskLoop
 from nanodot.core.write_flow import (
+    WRITE_AUTO,
     WRITE_DONE,
     WRITE_FAILED,
     WRITE_INTENT,
     WRITE_PROPOSED,
+    WRITE_SKIPPED,
     WRITE_UNKNOWN,
     WriteFlow,
 )
@@ -142,7 +144,8 @@ def test_port_surface_is_frozen() -> None:
 
 def test_readonly_denies_writes_even_with_a_write_token(home: Path) -> None:
     FileSecretStore().set("github-write-token", "ghp_write_123")
-    center = PermissionCenter()  # default mode: readonly
+    Config().set("permission-mode", "readonly")  # the explicit hard-off
+    center = PermissionCenter()
     assert center.mode() is Mode.READONLY
     with pytest.raises(WriteForbidden):
         center.assert_allowed("comment")
@@ -151,7 +154,70 @@ def test_readonly_denies_writes_even_with_a_write_token(home: Path) -> None:
     h = Harness(home, gated=False)
     h.tick()
     assert "write-proposed" not in h.kinds()
+    assert "write-auto" not in h.kinds()
     assert h.permissions.pending() == []
+    assert h.writer.sends == []
+
+
+# -- 2b. auto mode: standing grants, skip-and-record (#48 decision 5) ----------
+
+
+def test_auto_standing_grant_authorizes_and_sends_without_ever_asking(
+    home: Path,
+) -> None:
+    h = Harness(home, gated=False)  # default mode: auto
+    assert h.permissions.mode() is Mode.AUTO
+    h.permissions.create_standing_grant(
+        action="comment", target=str(TARGET), scope="watch", task_id=h.task.id
+    )
+    h.tick()
+    kinds = h.kinds()
+    assert WRITE_AUTO in kinds
+    assert WRITE_PROPOSED not in kinds  # nothing was ever asked
+    assert h.permissions.pending() == []
+    assert h.writer.sends == []  # the derived capability executes on the next run
+
+    h.clock.advance(300)
+    h.tick()
+    assert len(h.writer.sends) == 1
+    kinds = h.kinds()
+    assert WRITE_INTENT in kinds and WRITE_DONE in kinds
+    # Identical later polls neither re-ask nor re-send the same content.
+    h.clock.advance(300)
+    h.tick()
+    assert len(h.writer.sends) == 1
+    assert h.kinds().count(WRITE_AUTO) == 1
+    # The write did not disturb the watch itself.
+    task = h.store.get(h.task.id)
+    assert task.state.value == "active"
+
+
+def test_auto_without_a_standing_grant_skips_once_and_never_spams(
+    home: Path,
+) -> None:
+    h = Harness(home, gated=False)
+    h.tick()
+    kinds = h.kinds()
+    assert WRITE_SKIPPED in kinds
+    assert WRITE_PROPOSED not in kinds
+    assert h.permissions.pending() == []
+    assert h.writer.sends == []
+
+    h.clock.advance(300)
+    h.tick()  # same failing head: the skip is recorded once, not per poll
+    assert h.kinds().count(WRITE_SKIPPED) == 1
+    assert h.writer.sends == []
+
+    # A standing grant added later authorizes new content only.
+    h.github.set_pr("open", head_sha="s2")
+    h.github.add_check("ci", FAILURE, sha="s2")
+    h.permissions.create_standing_grant(
+        action="comment", target=str(TARGET), scope="watch", task_id=h.task.id
+    )
+    h.clock.advance(300)
+    h.tick()
+    assert WRITE_AUTO in h.kinds()
+    assert h.kinds().count(WRITE_SKIPPED) == 1
 
 
 # -- 3. no capability without approval ----------------------------------------

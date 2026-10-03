@@ -21,6 +21,7 @@ from nanodot.core.permissions import (
 )
 from nanodot.core.tasks import TaskStore
 from nanodot.native.github_client import GitHubSnapshotFetcher
+from nanodot.ports.github_writer import payload_digest
 
 SRC = Path(__file__).resolve().parent.parent / "src" / "nanodot"
 
@@ -106,12 +107,15 @@ def test_github_client_issues_gets_only() -> None:
 # -- readonly default and the gate ----------------------------------------------
 
 
-def test_default_mode_is_readonly(home: Path) -> None:
+def test_default_mode_is_auto(home: Path) -> None:
+    # #48 decision 5: auto is the default — pre-granted capabilities only,
+    # so a fresh install (no grants, no write token) is still inert.
     center = PermissionCenter()
-    assert center.mode() is Mode.READONLY
+    assert center.mode() is Mode.AUTO
 
 
 def test_gate_blocks_writes_in_readonly_mode(home: Path) -> None:
+    Config().set("permission-mode", "readonly")
     center = PermissionCenter()
     center.assert_allowed("read")  # reads always fine
     with pytest.raises(WriteForbidden):
@@ -136,21 +140,112 @@ def test_gated_mode_is_settable_and_admits_only_the_comment_action(home: Path) -
         center.assert_allowed("merge")  # unimplemented writes fail closed
 
 
-def test_auto_mode_is_rejected_and_never_enables_writes(home: Path) -> None:
-    with pytest.raises(ValueError, match="not an enabled permission mode"):
-        Config().set("mode", "auto")
-    # Pre-existing or manually edited configuration cannot bypass the gate.
-    home.mkdir(parents=True, exist_ok=True)
-    (home / "config.json").write_text(json.dumps({"mode": "auto"}))
+def test_auto_mode_is_the_default_and_settable(home: Path) -> None:
+    Config().set("mode", "auto")
     center = PermissionCenter()
-    with pytest.raises(ValueError, match="not supported"):
-        center.mode()
-    with pytest.raises(WriteForbidden):
-        center.assert_allowed("merge")
+    assert center.mode() is Mode.AUTO
     center.assert_allowed("read")
+    center.assert_allowed("comment")  # implemented write actions pass the gate
+    with pytest.raises(WriteForbidden):
+        center.assert_allowed("merge")  # unimplemented writes fail closed
 
 
 # -- scoped grants -----------------------------------------------------------------
+
+
+def test_authorize_auto_derives_a_single_use_content_bound_capability(
+    home: Path,
+) -> None:
+    Config().set("permission-mode", "auto")
+    center = PermissionCenter()
+    standing = center.create_standing_grant(
+        action="comment", target="owner/repo#1", scope="watch", task_id="t1"
+    )
+    capability = center.authorize_auto(
+        action="comment", target="owner/repo#1", scope="watch",
+        task_id="t1", payload={"body": "hello"},
+    )
+    assert capability is not None
+    assert capability.grant_id != standing.id  # a derived one-shot child
+    assert capability.content_hash == payload_digest({"body": "hello"})
+    # The derived capability appears in the task's pending set with its content.
+    [(pending, content)] = center.pending_capabilities("t1")
+    assert pending.grant_id == capability.grant_id
+    assert content == {"body": "hello"}
+    assert center.consume(capability.grant_id) is True
+    assert center.consume(capability.grant_id) is False  # single use
+
+
+def test_authorize_auto_returns_none_without_a_live_standing_grant(
+    home: Path,
+) -> None:
+    Config().set("permission-mode", "auto")
+    center = PermissionCenter()
+    assert center.authorize_auto(
+        action="comment", target="owner/repo#1", scope="watch",
+        task_id="t1", payload={"body": "hi"},
+    ) is None
+    # Content-bound grants (interactive approvals) never match in auto.
+    req = center.request(
+        action="comment", target="owner/repo#1", scope="watch",
+        task_id="t1", content={"body": "hi"},
+    )
+    center.approve(req.id)
+    assert center.authorize_auto(
+        action="comment", target="owner/repo#1", scope="watch",
+        task_id="t1", payload={"body": "hi"},
+    ) is None
+    # Standing grants that expired or were revoked never match.
+    center.create_standing_grant(
+        action="comment", target="owner/repo#1", scope="watch", task_id="t2",
+        expires_at=1.0,
+    )
+    assert center.authorize_auto(
+        action="comment", target="owner/repo#1", scope="watch",
+        task_id="t2", payload={"body": "hi"},
+    ) is None
+    standing = center.create_standing_grant(
+        action="comment", target="owner/repo#1", scope="watch", task_id="t3"
+    )
+    center.revoke(standing.id)
+    assert center.authorize_auto(
+        action="comment", target="owner/repo#1", scope="watch",
+        task_id="t3", payload={"body": "hi"},
+    ) is None
+    # Exact scope matching: a different target does not match.
+    center.create_standing_grant(
+        action="comment", target="owner/repo#1", scope="watch", task_id="t4"
+    )
+    assert center.authorize_auto(
+        action="comment", target="other/repo#2", scope="watch",
+        task_id="t4", payload={"body": "hi"},
+    ) is None
+
+
+def test_authorize_auto_requires_auto_mode(home: Path) -> None:
+    Config().set("permission-mode", "gated")
+    center = PermissionCenter()
+    center.create_standing_grant(
+        action="comment", target="owner/repo#1", scope="watch", task_id="t1"
+    )
+    with pytest.raises(WriteForbidden, match="requires auto mode"):
+        center.authorize_auto(
+            action="comment", target="owner/repo#1", scope="watch",
+            task_id="t1", payload={"body": "hi"},
+        )
+
+
+def test_scope_change_revokes_a_standing_grant(home: Path) -> None:
+    Config().set("permission-mode", "auto")
+    center = PermissionCenter()
+    center.create_standing_grant(
+        action="comment", target="owner/repo#1", scope="watch", task_id="t1"
+    )
+    assert center.on_scope_change("t1") == 1
+    assert center.authorize_auto(
+        action="comment", target="owner/repo#1", scope="watch",
+        task_id="t1", payload={"body": "hi"},
+    ) is None
 
 
 def _approved_grant(center: PermissionCenter, **overrides):
@@ -313,6 +408,6 @@ def test_approvals_command_shows_mode_and_empty_state(
 
     assert main(["approvals"]) == 0
     out = capsys.readouterr().out
-    assert "mode: readonly" in out
+    assert "mode: auto" in out  # the default since #48 decision 5
     assert "pending approvals: 0" in out
     assert "active grants: 0" in out

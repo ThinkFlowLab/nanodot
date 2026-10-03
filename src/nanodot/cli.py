@@ -166,7 +166,7 @@ def _wiring(teardown: Teardown | None = None) -> tuple:
     write = None
     center = PermissionCenter()
     own("permission-center", center.close)
-    if center.mode() is Mode.GATED:
+    if center.mode() in (Mode.GATED, Mode.AUTO):
         from nanodot.native.github_writer import GitHubWriter
 
         write = WriteFlow(

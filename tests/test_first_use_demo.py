@@ -53,6 +53,9 @@ def _demo(tmp_path: Path):
     demo = module.Demo(home)
     demo.cli("config", "set", "github-auth-mode", "anonymous")
     demo.cli("config", "set", "os-notifications", "false")
+    # These are read-only watch behaviors: keep the write flow out of the
+    # inbox assertions (auto is the installed default mode).
+    demo.cli("config", "set", "permission-mode", "readonly")
     demo.cli("watch", "add", module.TARGET, "--yes", "--cadence", "300")
     return demo, demo.rows("tasks")[0]["id"]
 

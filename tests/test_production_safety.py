@@ -170,12 +170,17 @@ def test_secret_hidden_prompt(home, monkeypatch, capsys):
     assert SECRET not in capsys.readouterr().out
 
 
-@pytest.mark.parametrize("mode", ["auto", "typo"])
+@pytest.mark.parametrize("mode", ["typo"])
 def test_cli_rejects_unimplemented_modes(home, capsys, mode):
-    """gated is implemented (writer port); auto and typos stay rejected."""
+    """Typos stay rejected; all three modes are implemented (#48 decision 5)."""
     assert main(["config", "set", "mode", mode]) == 1
     assert Config().get("mode") is None
     assert "readonly" in capsys.readouterr().err
+
+
+def test_cli_accepts_auto_mode(home):
+    assert main(["config", "set", "mode", "auto"]) == 0
+    assert Config().get("mode") == "auto"
 
 
 def test_cli_accepts_gated_mode(home):
