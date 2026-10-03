@@ -250,6 +250,12 @@ nanodot config set provider.glm.model glm-4.7
 # The registry presets the base URL per provider (api.openai.com,
 # api.anthropic.com, open.bigmodel.cn, api.deepseek.com); override with
 # provider.<name>.base-url — https only, pinned at startup.
+
+# Optional hard cap on model calls per provider per day (degrades to raw
+# notifications when reached — never an error):
+
+nanodot config set model-daily-limit 200
+nanodot model usage   # per-provider calls and tokens, local only
 nanodot watch add --intent 'watch owner/repo#123 until required checks pass'
 ```
 

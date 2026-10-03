@@ -29,6 +29,33 @@ from nanodot.ports.inference import (
 )
 
 DEFAULT_BASE_URL = "https://api.openai.com/v1"
+DEFAULT_PROVIDER_NAME = "openai-compat"
+
+
+def _budget_check(name, usage, daily_limit) -> None:
+    if usage is None or daily_limit is None:
+        return
+    if usage.calls_today(name) >= daily_limit:
+        raise ProviderError(
+            f"model daily limit reached ({daily_limit} calls for {name} today); "
+            "raise or unset model-daily-limit to continue"
+        )
+
+
+def _tokens_of(usage_block: dict, in_key: str, out_key: str) -> tuple[int, int]:
+    return (
+        int(usage_block.get(in_key) or 0),
+        int(usage_block.get(out_key) or 0),
+    )
+
+
+def _record_usage(name, usage, usage_block: dict) -> None:
+    if usage is None or not usage_block:
+        return
+    input_tokens, output_tokens = _tokens_of(
+        usage_block, "prompt_tokens", "completion_tokens"
+    )
+    usage.record(name, input_tokens=input_tokens, output_tokens=output_tokens)
 API_KEY_SECRET = "api-key"
 DEFAULT_REQUEST_TIMEOUT = 5.0
 
@@ -56,6 +83,9 @@ class APIInferenceProvider(InferenceProvider):
         model: str = "gpt-4o-mini",
         redactor: Redactor | None = None,
         timeout: float = DEFAULT_REQUEST_TIMEOUT,
+        name: str = DEFAULT_PROVIDER_NAME,
+        usage=None,
+        daily_limit: int | None = None,
     ) -> None:
         if timeout <= 0:
             raise ValueError("provider timeout must be positive")
@@ -65,10 +95,14 @@ class APIInferenceProvider(InferenceProvider):
         self._model = model
         self._redactor = redactor
         self._guard = EgressGuard(scrubber=self._scrub)
+        self._name = name
+        self._usage = usage
+        self._daily_limit = daily_limit
 
     # -- transport ---------------------------------------------------------
 
     def _chat(self, system: str, user: str) -> str:
+        _budget_check(self._name, self._usage, self._daily_limit)
         body = json.dumps(
             {
                 "model": self._scrub(self._model),
@@ -90,6 +124,7 @@ class APIInferenceProvider(InferenceProvider):
             )
             with authenticated_urlopen(request, timeout=self._timeout) as response:
                 payload = json.loads(response.read().decode())
+            _record_usage(self._name, self._usage, payload.get("usage") or {})
         except urllib.error.HTTPError as error:
             detail = self._scrub(error.read().decode(errors="replace"))[:200]
             raise ProviderError(f"model API error {error.code}: {detail}") from error
