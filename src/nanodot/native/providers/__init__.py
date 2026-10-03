@@ -153,9 +153,11 @@ def configured_provider() -> InferenceProvider | None:
     except ValueError as error:
         return _MisconfiguredProvider(str(error))
     limit = config.get("model-daily-limit")
-    return factory(
+    from nanodot.native.providers.retry import RetryingProvider
+
+    return RetryingProvider(factory(
         api_key=api_key, base_url=base_url, model=str(model),
         timeout=timeout, redactor=Redactor(secrets), name=name,
         usage=shared_usage_store(),
         daily_limit=int(limit) if limit is not None else None,
-    )
+    ))

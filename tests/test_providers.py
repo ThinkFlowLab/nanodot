@@ -24,6 +24,13 @@ from nanodot.native.providers import (
 )
 from nanodot.native.providers.anthropic import AnthropicProvider
 from nanodot.native.providers.openai_compat import APIInferenceProvider
+
+
+def unwrap(provider):
+    """See through the retry wrapper to the protocol adapter."""
+    from nanodot.native.providers.retry import RetryingProvider
+
+    return provider._inner if isinstance(provider, RetryingProvider) else provider
 from nanodot.native.secrets_file import FileSecretStore
 from nanodot.ports.inference import ProviderError, StateChange
 
@@ -78,9 +85,9 @@ def test_legacy_keys_build_openai_compat_unchanged(home: Path) -> None:
     Config().set("model-base-url", "https://model.test/v1")
     Config().set("model-name", "m1")
     provider = configured_provider()
-    assert isinstance(provider, APIInferenceProvider)
-    assert provider._base_url == "https://model.test/v1"
-    assert provider._model == "m1"
+    assert isinstance(unwrap(provider), APIInferenceProvider)
+    assert unwrap(provider)._base_url == "https://model.test/v1"
+    assert unwrap(provider)._model == "m1"
 
 
 def test_namespaced_keys_win_and_use_presets(home: Path) -> None:
@@ -89,9 +96,9 @@ def test_namespaced_keys_win_and_use_presets(home: Path) -> None:
     Config().set("model-provider", "glm")
     Config().set("provider.glm.model", "glm-4.7")
     provider = configured_provider()
-    assert isinstance(provider, APIInferenceProvider)
-    assert provider._base_url == "https://open.bigmodel.cn/api/paas/v4"
-    assert provider._model == "glm-4.7"
+    assert isinstance(unwrap(provider), APIInferenceProvider)
+    assert unwrap(provider)._base_url == "https://open.bigmodel.cn/api/paas/v4"
+    assert unwrap(provider)._model == "glm-4.7"
 
 
 def test_custom_base_url_overrides_preset(home: Path) -> None:
@@ -99,7 +106,7 @@ def test_custom_base_url_overrides_preset(home: Path) -> None:
     Config().set("model-provider", "glm")
     Config().set("provider.glm.model", "glm-4.7")
     Config().set("provider.glm.base-url", "https://my-vllm.internal/v1")
-    assert configured_provider()._base_url == "https://my-vllm.internal/v1"
+    assert unwrap(configured_provider())._base_url == "https://my-vllm.internal/v1"
 
 
 def test_invalid_url_is_observable_not_silent(home: Path) -> None:
