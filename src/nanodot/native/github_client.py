@@ -7,6 +7,7 @@ access to public metadata and never reads or sends a configured token.
 
 from __future__ import annotations
 
+import http.client
 import json
 import time
 import urllib.error
@@ -67,7 +68,14 @@ class GitHubSnapshotFetcher(SnapshotFetcher):
             "Accept": "application/vnd.github+json",
             "X-GitHub-Api-Version": "2022-11-28",
         }
-        token = self._auth_token()
+        # A local secret-store failure (symlinked, unreadable, churning) is
+        # a configuration blocker, never a GitHub or network condition.
+        try:
+            token = self._auth_token()
+        except AuthLostError:
+            raise
+        except (ValueError, OSError) as error:
+            raise AuthLostError(f"local secret store unusable: {error}") from error
         if token is not None:
             headers["Authorization"] = f"Bearer {token}"
         request = urllib.request.Request(
@@ -82,7 +90,18 @@ class GitHubSnapshotFetcher(SnapshotFetcher):
                     raise RetryableError("malformed GitHub response")
                 return result
         except urllib.error.HTTPError as error:
-            body = error.read().decode(errors="replace")
+            try:
+                body = error.read().decode(errors="replace")
+            except (OSError, http.client.HTTPException):
+                body = ""  # the status alone still classifies the failure
+            if error.code in (301, 308):
+                # Redirects are deliberately never followed (the token must
+                # not leave the configured host), so a permanent move — e.g.
+                # a renamed owner/repo — is a blocker, not an endless retry.
+                raise PRNotFoundError(
+                    f"GitHub moved this resource permanently (HTTP {error.code}); "
+                    "update the watch target"
+                ) from error
             if error.code == 401:
                 access = "anonymous access" if self._auth_mode == "anonymous" else "the token"
                 raise AuthLostError(
@@ -110,7 +129,10 @@ class GitHubSnapshotFetcher(SnapshotFetcher):
             ) from error
         except (json.JSONDecodeError, UnicodeDecodeError) as error:
             raise RetryableError("malformed GitHub JSON response") from error
-        except (urllib.error.URLError, TimeoutError, OSError) as error:
+        except (urllib.error.URLError, TimeoutError, OSError,
+                http.client.HTTPException) as error:
+            # HTTPException (e.g. IncompleteRead on a truncated body) is a
+            # routine transport failure and belongs with network trouble.
             raise RetryableError(f"network error: {error}") from error
 
     def _pages(self, path: str, key: str | None = None, sha: str | None = None) -> list[dict]:
@@ -271,7 +293,10 @@ class GitHubSnapshotFetcher(SnapshotFetcher):
                 workflows = self._pages(
                     f"/repos/{repo}/actions/runs?check_suite_id={suite_id}", "workflow_runs"
                 )
-                eligible = {"push", "pull_request", "pull_request_review", "pull_request_target", "deployment", "deployment_status"}
+                # Reusable workflows (workflow_call) run on the PR head with
+                # their own suite and are legitimate required PR checks; runs
+                # triggered by other workflows or schedules are not.
+                eligible = {"push", "pull_request", "pull_request_review", "pull_request_target", "deployment", "deployment_status", "workflow_call"}
                 if len(workflows) != 1:
                     unresolved = True
                 else:

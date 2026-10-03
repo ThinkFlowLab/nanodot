@@ -7,3 +7,5 @@ build/
 .pytest_cache/
 node_modules/
 *.tgz
+run-logs/
+.zcodeignore

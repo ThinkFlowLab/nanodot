@@ -22,6 +22,7 @@ from pathlib import Path
 
 from nanodot import __version__
 from nanodot.paths import data_home
+from nanodot.core.teardown import Teardown
 from nanodot.core.tasks import (
     DEFAULT_NOTIFICATION_CONDITIONS, DEFAULT_STOP_CONDITIONS,
 )
@@ -98,6 +99,8 @@ def build_parser() -> argparse.ArgumentParser:
     # -- activity / inbox --------------------------------------------------
     activity = subparsers.add_parser("activity", help="what actually ran")
     activity.add_argument("task_id", nargs="?")
+    activity.add_argument("--all", action="store_true",
+                          help="include per-poll check observations")
     subparsers.add_parser("inbox", help="notifications received")
 
     # -- runner ------------------------------------------------------------
@@ -114,7 +117,7 @@ def build_parser() -> argparse.ArgumentParser:
 # -- shared wiring -----------------------------------------------------------
 
 
-def _wiring() -> tuple:
+def _wiring(teardown: Teardown | None = None) -> tuple:
     from nanodot.core.activity import ActivityLog
     from nanodot.core.config import Config
     from nanodot.core.memory import MemoryStore
@@ -142,6 +145,13 @@ def _wiring() -> tuple:
         store, fetcher, sink, activity,
         provider=configured_provider(), memory=memory,
     )
+    if teardown is not None:
+        # Registrations are effects: creation order here, reverse unwind in
+        # Teardown.run — the loop drains before its stores close.
+        teardown.register("task-store", store.close)
+        teardown.register("activity-log", activity.close)
+        teardown.register("memory-store", memory.close)
+        teardown.register("task-loop", loop.close)
     return secrets, store, activity, sink, fetcher, loop
 
 
@@ -181,7 +191,7 @@ def _run_config(args: argparse.Namespace) -> int:
                 file=sys.stderr,
             )
             return 1
-        except (RunnerControlError, OSError) as error:
+        except (RunnerControlError, OSError, ValueError) as error:
             print(f"error: {error}", file=sys.stderr)
             return 1
     return _run_config_values(args)
@@ -207,24 +217,48 @@ def _run_config_values(args: argparse.Namespace) -> int:
             print("error: a nonempty value is required", file=sys.stderr)
             return 1
         if is_secret_name(args.name):
-            store.set(args.name, value)
-            config.unset(args.name)  # remove a legacy plaintext copy after safe save
+            try:
+                store.set(args.name, value)
+                config.unset(args.name)  # remove a legacy plaintext copy after safe save
+            except (ValueError, OSError) as error:
+                print(f"error: {error}", file=sys.stderr)
+                return 1
         else:
             try:
                 config.set(args.name, value)
-            except ValueError as error:
+            except (ValueError, OSError) as error:
                 print(f"error: {error}", file=sys.stderr)
                 return 1
     elif args.config_command == "unset":
-        if is_secret_name(args.name):
-            store.unset(args.name)
+        try:
+            if is_secret_name(args.name):
+                store.unset(args.name)
             config.unset(args.name)
-        else:
-            config.unset(args.name)
-    else:  # list
-        rows = [(key, MASK if is_secret_name(key) else str(config.get(key)))
-                for key in config.keys() if key not in store.names()]
-        rows += [(name, MASK) for name in store.names()]
+        except (ValueError, OSError) as error:
+            print(f"error: {error}", file=sys.stderr)
+            return 1
+    else:  # list — the diagnosis command must survive a damaged state
+        try:
+            keys = config.keys()
+            secret_names = store.names()
+        except (ValueError, OSError) as error:
+            print(f"error: {error}", file=sys.stderr)
+            return 1
+        rows: list[tuple[str, str]] = []
+        for key in keys:
+            if key in secret_names:
+                continue
+            if is_secret_name(key):
+                # A legacy plaintext copy stored before the secret store
+                # existed must never be echoed back in the clear.
+                rows.append((key, MASK))
+                continue
+            try:
+                value = str(config.get(key))
+            except ValueError as error:
+                value = f"<invalid: {error}>"
+            rows.append((key, value))
+        rows += [(name, MASK) for name in secret_names]
         for key, value in sorted(rows):
             print(f"{key}={value}")
     return 0
@@ -239,6 +273,7 @@ def _run_watch(args: argparse.Namespace) -> int:
 
     from nanodot.core.activity import ActivityLog
     from nanodot.core.redaction import Redactor
+    from nanodot.core.runner import CHECK_OBSERVED
     from nanodot.core.tasks import TaskStore
 
     secrets = FileSecretStore()
@@ -251,10 +286,11 @@ def _run_watch(args: argparse.Namespace) -> int:
 
         try:
             auth_mode = Config().get("github-auth-mode", "token")
-        except ValueError as error:
+            has_token = bool(secrets.get("github-token"))
+        except (ValueError, OSError) as error:
             print(f"error: {error}", file=sys.stderr)
             return 1
-        if auth_mode == "token" and not secrets.get("github-token"):
+        if auth_mode == "token" and not has_token:
             print(
                 "error: no GitHub token configured — run: "
                 "nanodot config set github-token (hidden prompt)",
@@ -321,7 +357,12 @@ def _run_watch(args: argparse.Namespace) -> int:
             for item in relevant:
                 print(f"    - {item.content}")
         if not args.yes:
-            answer = input("Proceed? [y/N] ").strip().lower()
+            try:
+                answer = input("Proceed? [y/N] ").strip().lower()
+            except EOFError:
+                # Non-interactive stdin (cron, scripts, closed pipes) must
+                # decline, not crash — mirroring the secret-prompt path.
+                answer = "n"
             if answer not in ("y", "yes"):
                 print("cancelled")
                 return 1
@@ -345,7 +386,9 @@ def _run_watch(args: argparse.Namespace) -> int:
             print("no tasks — create one with: nanodot watch add owner/repo#1")
             return 0
         for task in tasks:
-            latest = activity.query(task_id=task.id, limit=1)
+            latest = activity.query(
+                task_id=task.id, exclude_kinds=(CHECK_OBSERVED,), limit=1
+            )
             latest_text = latest[0].message if latest else "-"
             if len(latest_text) > 60:
                 latest_text = latest_text[:57] + "..."
@@ -371,7 +414,9 @@ def _run_watch(args: argparse.Namespace) -> int:
     print(f"  state:                  {task.state.value}")
     if task.blocker:
         print(f"  blocker:                {task.blocker}")
-    entries = activity.query(task_id=task.id, limit=5)
+    entries = activity.query(
+        task_id=task.id, exclude_kinds=(CHECK_OBSERVED,), limit=5
+    )
     if entries:
         print("  recent activity:")
         for entry in reversed(entries):
@@ -420,6 +465,9 @@ def _run_memory(args: argparse.Namespace) -> int:
                 print("memory is empty")
             for item in items:
                 _print_memory_item(item)
+            total = memory.count()
+            if total > len(items):
+                print(f"... and {total - len(items)} older item(s) not shown")
         return 0
     except ValueError as error:
         print(f"error: {error}", file=sys.stderr)
@@ -467,9 +515,13 @@ def _run_approvals(_: argparse.Namespace) -> int:
 
 def _run_activity(args: argparse.Namespace) -> int:
     from nanodot.core.activity import ActivityLog
+    from nanodot.core.runner import CHECK_OBSERVED
 
     activity = ActivityLog()
-    entries = activity.query(task_id=getattr(args, "task_id", None), limit=50)
+    exclude = None if args.all else (CHECK_OBSERVED,)
+    entries = activity.query(
+        task_id=getattr(args, "task_id", None), exclude_kinds=exclude, limit=50
+    )
     if not entries:
         print("no activity yet")
         return 0
@@ -505,6 +557,7 @@ def _run_runner(args: argparse.Namespace) -> int:
     from nanodot.native.runner_control import RunnerControlError, RunnerLease
 
     stop = threading.Event()
+    teardown = Teardown()
 
     def _sigint(_signum, _frame) -> None:
         stop.set()
@@ -514,28 +567,37 @@ def _run_runner(args: argparse.Namespace) -> int:
 
     def prepare() -> None:
         nonlocal store, daemon
-        _, store, _, _, _, loop = _wiring()
+        _, store, _, _, _, loop = _wiring(teardown)
         daemon = RunnerDaemon(loop, store)
 
     try:
         with RunnerLease(_pidfile(), stop, prepare=prepare):
-            assert store is not None and daemon is not None
-            if args.once:
-                attempted = daemon.tick(stop=stop)
-                blockers = [t for t in store.list() if t.blocker]
-                if blockers:
-                    for task in blockers:
-                        print(f"blocked: {task.id} ({task.target}): {task.blocker}",
-                              file=sys.stderr)
-                    return 1
-                print(f"ran {attempted} task(s)")
+            try:
+                assert store is not None and daemon is not None
+                if args.once:
+                    attempted = daemon.tick(stop=stop)
+                    blockers = [t for t in store.list() if t.blocker]
+                    if blockers:
+                        for task in blockers:
+                            print(f"blocked: {task.id} ({task.target}): {task.blocker}",
+                                  file=sys.stderr)
+                        return 1
+                    print(f"ran {attempted} task(s)")
+                    return 0
+                signal.signal(signal.SIGINT, _sigint)
+                signal.signal(signal.SIGTERM, _sigint)
+                print("nanodot runner started — Ctrl-C to stop", flush=True)
+                daemon.serve(stop)
+                print("nanodot runner stopped")
                 return 0
-            signal.signal(signal.SIGINT, _sigint)
-            signal.signal(signal.SIGTERM, _sigint)
-            print("nanodot runner started — Ctrl-C to stop", flush=True)
-            daemon.serve(stop)
-            print("nanodot runner stopped")
-            return 0
+            finally:
+                # Unwind while still owning the lifetime lock, in reverse
+                # registration order: the next runner never meets a
+                # half-closed store, and a failing step never blocks the
+                # rest of the shutdown.
+                for name in teardown.run():
+                    print(f"warning: {name} did not shut down cleanly",
+                          file=sys.stderr)
     except (RunnerControlError, OSError, ValueError) as error:
         print(f"error: {error}", file=sys.stderr)
         return 1

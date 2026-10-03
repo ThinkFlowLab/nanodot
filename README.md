@@ -119,6 +119,15 @@ Only one runner may hold a data home's lifetime lock. Shutdown is cooperative;
 a timeout reports that stopping is still pending rather than signaling a saved
 PID or claiming the process exited.
 
+### The activity log is a decision log
+
+Every poll records what the runner observed (`check-observed` entries) before
+any events it produced, and every event's evidence names the policy rule that
+fired (`stop:`, `notify:`, `record:`). A run overtaken by a pause, cancel, or
+scope change records nothing. Replaying the log reproduces every stop/notify
+decision without re-asking GitHub. The default `nanodot activity` view hides
+per-poll observations so events stay readable; pass `--all` to include them.
+
 ### Fixed watch policy
 
 This MVP supports a fixed, validated policy. It notifies on new commits, check
@@ -211,6 +220,17 @@ transports are replaced by fakes. Dead proxy settings are inherited by child
 processes. This is a test tripwire, not an OS firewall sandbox for arbitrary
 subprocesses. CI applies offline proxy settings to the test step only, after
 checkout, Python setup, and dependency installation.
+
+## Documentation
+
+- [Installation](docs/installation.md): prerequisites, source setup, updates,
+  development setup, and installation troubleshooting.
+- [User guide](docs/user-guide.md): authentication, first PR watch, runner,
+  notifications, task management, memory, optional models, and troubleshooting.
+- [First-use walkthrough](docs/first-pr-watch.md): the full watch lifecycle,
+  background runner, cancellation, and verification details.
+- [npm packaging](docs/npm-packaging.md): installing via npm on macOS or Linux,
+  and testing a package before publication.
 
 See [adapter contracts](docs/design/adapter-seam.md) for dependency direction and
 [the safety/validation review](docs/design/safety-validation.md) for the review

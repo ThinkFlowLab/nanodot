@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import string
 import threading
 import time
 import uuid
@@ -47,6 +48,28 @@ STATUS_CONFIRMED = "confirmed"
 STATUS_PROPOSED = "proposed"
 
 DEFAULT_PROPOSAL_EXPIRY_SECONDS = 14 * 24 * 3600  # 14 days
+
+
+def _require_content(content: str) -> None:
+    """Empty items can never match anything and would persist forever."""
+    if not content or not content.strip():
+        raise ValueError("memory content must not be empty")
+
+
+def _keywords(text: str) -> set[str]:
+    """One tokenizer for both query and content sides of relevant_to.
+
+    Recorded observations carry the PR identity as 'owner/repo#12: ...', so
+    splitting on '#' and trimming edge punctuation must happen identically
+    on both sides or the one token guaranteed shared — the target itself —
+    can never match.
+    """
+    words = set()
+    for token in text.replace("#", " ").split():
+        trimmed = token.strip(string.punctuation)
+        if len(trimmed) > 3:
+            words.add(trimmed.lower())
+    return words
 
 
 @dataclass(frozen=True)
@@ -105,6 +128,7 @@ class MemoryStore:
         self, content: str, kind: str = KIND_PREFERENCE, at: float | None = None
     ) -> MemoryItem:
         """Write path 1: the user stated it. Enters confirmed."""
+        _require_content(content)
         return self._insert(
             kind=kind,
             content=content,
@@ -123,6 +147,7 @@ class MemoryStore:
         """Write path 2: an evidenced terminal outcome, auto-recorded by
         the runner. Observation, confirmed-by-evidence, provenance links
         the evidence."""
+        _require_content(content)
         return self._insert(
             kind=KIND_OBSERVATION,
             content=content,
@@ -141,6 +166,7 @@ class MemoryStore:
     ) -> MemoryItem:
         """Write path 3: a proposal (e.g. from a model). Proposed only —
         confirmation is a separate, user-driven act."""
+        _require_content(content)
         now = at if at is not None else self._clock.time()
         return self._insert(
             kind=kind,
@@ -178,6 +204,7 @@ class MemoryStore:
         return replace(item, status=STATUS_CONFIRMED, expires_at=None)
 
     def edit(self, item_id: str, content: str) -> MemoryItem:
+        _require_content(content)
         self._require(item_id)
         with self._lock:
             self._conn.execute(
@@ -251,6 +278,15 @@ class MemoryStore:
             ).fetchall()
         return [self._row_to_item(row) for row in rows]
 
+    def count(self, status: str | None = None) -> int:
+        self.sweep_expired()
+        clause, params = ("WHERE status=?", [status]) if status else ("", [])
+        with self._lock:
+            row = self._conn.execute(
+                f"SELECT COUNT(*) FROM memory {clause}", params
+            ).fetchone()
+        return int(row[0])
+
     def context_for_prompts(self) -> list[str]:
         """Confirmed content only — what the local read path may consult."""
         return [item.content for item in self.list(status=STATUS_CONFIRMED)]
@@ -258,11 +294,10 @@ class MemoryStore:
     def relevant_to(self, text: str) -> list[MemoryItem]:
         """Confirmed items whose content shares words with the text — the
         local 'remembered context' surfaced at task creation."""
-        words = {w.lower() for w in text.replace("#", " ").split() if len(w) > 3}
+        words = _keywords(text)
         out = []
         for item in self.list(status=STATUS_CONFIRMED):
-            item_words = {w.lower() for w in item.content.split() if len(w) > 3}
-            if item_words & words:
+            if _keywords(item.content) & words:
                 out.append(item)
         return out
 

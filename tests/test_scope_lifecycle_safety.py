@@ -394,7 +394,7 @@ def test_empty_allowed_actions_cannot_authorize_a_read(home):
     assert store.list() == []
 
 
-@pytest.mark.parametrize("conclusion", ["error", "stale"])
+@pytest.mark.parametrize("conclusion", ["error", "stale", "startup_failure"])
 def test_failure_names_use_same_conclusions_as_evaluator(conclusion):
     task = make_task()
     github = FakeGitHub(TARGET)

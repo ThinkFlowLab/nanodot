@@ -129,7 +129,8 @@ def test_atomic_save_replaces_inode_and_restores_private_mode(home: Path) -> Non
     assert path.stat().st_ino != old_inode
     assert stat.S_IMODE(path.stat().st_mode) == 0o600
     assert store.get("github-token") == "rotated-token"
-    assert sorted(p.name for p in home.iterdir()) == ["secrets.json"]
+    contents = sorted(p.name for p in home.iterdir())
+    assert contents == ["secrets.json", "secrets.json.lock"]
 
 
 @pytest.mark.parametrize("operation", ["get", "set", "unset", "names"])
@@ -176,6 +177,40 @@ def test_atomic_replace_does_not_follow_late_symlink(
     assert victim.read_text() == "untouched"
     assert not (home / "secrets.json").is_symlink()
     assert store.get("api-key") == "second-secret"
+
+
+def test_rotation_between_lstat_and_open_retries_instead_of_failing(
+    home: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = FileSecretStore()
+    store.set("github-token", "old-token")
+    path = home / "secrets.json"
+    real_open = os.open
+    rotations = 0
+
+    def rotating_open(file, flags, *args, **kwargs):
+        # Land one concurrent atomic rotation inside the lstat→open window:
+        # replace the directory entry right before the real open happens.
+        nonlocal rotations
+        if Path(file) == path:
+            rotations += 1
+            if rotations == 1:
+                FileSecretStore()._save({"github-token": "new-token"})
+        return real_open(file, flags, *args, **kwargs)
+
+    monkeypatch.setattr(os, "open", rotating_open)
+    assert store.get("github-token") == "new-token"
+    assert rotations == 1  # the raced entry resolves to the opened rotation
+
+
+def test_continuous_rotation_never_breaks_readers(home: Path) -> None:
+    store = FileSecretStore()
+    store.set("github-token", "old-token")
+    writer = FileSecretStore()
+    for rotation in range(200):
+        writer.set("github-token", f"rotated-{rotation}")
+        # Every read must observe some complete value, never raise.
+        assert store.get("github-token").startswith(("old", "rotated-"))
 
 
 @pytest.mark.parametrize("nofollow", [True, False])
@@ -225,7 +260,8 @@ def test_failed_atomic_save_preserves_original_and_removes_temporary(
         store.set("api-key", "second-secret")
 
     assert (home / "secrets.json").read_bytes() == original
-    assert sorted(p.name for p in home.iterdir()) == ["secrets.json"]
+    contents = sorted(p.name for p in home.iterdir())
+    assert contents == ["secrets.json", "secrets.json.lock"]
 
 
 def test_atomic_save_syncs_file_before_replace_then_directory(

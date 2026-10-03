@@ -4,15 +4,16 @@ from __future__ import annotations
 
 import io
 import json
+from dataclasses import asdict
 from pathlib import Path
 
 import pytest
 from fakes import FAILURE, FakeClock, FakeGitHub, FakeProvider, FakeSink
 
 from nanodot.core.activity import ActivityLog
-from nanodot.core.egress import EgressGuard
+from nanodot.core.egress import EgressGuard, SUMMARIZE_FIELDS
 from nanodot.core.redaction import Redactor
-from nanodot.core.runner import TaskLoop
+from nanodot.core.runner import RunOutcome, TaskLoop, state_change_from_event
 from nanodot.core.statemachine import CHECKS_FAILED, WatchEvent
 from nanodot.core.tasks import PRTarget, Task, TaskStore
 from nanodot.native.inference_api import APIInferenceProvider, configured_provider
@@ -56,6 +57,47 @@ def test_outbound_values_are_scrubbed_of_secrets(home: Path) -> None:
         StateChange(kind="x", summary=f"failure mentioning {API_KEY}")
     )
     assert API_KEY not in payload["summary"]
+
+
+# -- egress tripwire: provider-visible implies activity-logged --------------
+
+
+def test_egress_is_a_projection_of_the_activity_log(home: Path) -> None:
+    """Adapted from DSH's 'model-visible ⟺ logged' invariant
+    (docs/design/adapter-seam.md, admission discipline 3): every field that
+    reaches the provider is reconstructable from the activity log. Widening
+    the provider-visible surface must fail here until it is whitelisted in
+    docs/design/egress.md and recorded to the log."""
+    store = TaskStore(path=home / "nanodot.db")
+    activity = ActivityLog(path=home / "nanodot.db")
+    github = FakeGitHub(TARGET)
+    github.set_pr("open", head_sha="s1")
+    github.add_check("ci", FAILURE, sha="s1")
+    sink = FakeSink()
+    provider = FakeProvider()
+    loop = TaskLoop(store, github, sink, activity, provider=provider)
+    task = store.create(
+        Task(target=TARGET, purpose="watch", cadence_seconds=300, next_check_at=0.0)
+    )
+
+    assert loop.run_once(store.get(task.id), 0.0) is RunOutcome.OK
+    assert provider.summarize_payloads, "a notable event was summarized"
+
+    entries = activity.query(task_id=task.id, limit=1000)
+    for change in provider.summarize_payloads:
+        # The StateChange surface is exactly the documented whitelist.
+        assert set(asdict(change)) == set(SUMMARIZE_FIELDS)
+        # ...and every payload is reconstructable from a log entry.
+        reconstructed = [
+            state_change_from_event(
+                WatchEvent(kind=e.kind, message=e.message, evidence=dict(e.evidence))
+            )
+            for e in entries
+            if e.kind == change.kind and e.message == change.summary
+        ]
+        assert change in reconstructed, (
+            f"provider saw {change.kind!r} that the activity log cannot reconstruct"
+        )
 
 
 # -- API adapter: same interface, egress-controlled body --------------------
@@ -299,3 +341,25 @@ def test_cli_runner_wiring_uses_configured_provider(home, monkeypatch):
     assert len(provider.summarize_payloads) == 1
     assert sink.kinds() == [CHECKS_FAILED]
     assert sink.events[0].summary == "A short model summary."
+
+
+def test_truncated_response_body_is_a_provider_error(monkeypatch) -> None:
+    import http.client
+
+    class _Truncated(io.BytesIO):
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def read(self, *args):
+            raise http.client.IncompleteRead(b"{partial")
+
+    monkeypatch.setattr(
+        "nanodot.native.inference_api.authenticated_urlopen",
+        lambda request, timeout=None: _Truncated(b""),
+    )
+    provider = APIInferenceProvider(api_key=API_KEY)
+    with pytest.raises(ProviderError, match="unreachable"):
+        provider.parse_intent("watch owner/repo#1")

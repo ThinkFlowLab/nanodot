@@ -17,9 +17,33 @@ adapters (DSH, openJiuwen are candidates): none shipped
    the seam made executable.
 3. **Trigger to add an adapter.** A demonstrated native-runner limitation —
    realistically, execution continuity beyond an awake host, or dispatch
-   beyond one machine. Until one shows up, this document keeps the ports
-   coherent; no plugin machinery, adapter configuration, or dual-runner
-   support is built.
+   beyond one machine. Swappability alone never justifies machinery: the
+   fakes already substitute every port (rule 2). The machinery-grade trigger
+   is a second party extending nanodot without forking it. Until one shows
+   up, this document keeps the ports coherent; no plugin machinery, adapter
+   configuration, or dual-runner support is built.
+
+## Adapter admission discipline
+
+Borrowed from DeepSeek Harness (DSH)'s plugin rules — the discipline, not
+the machinery. These bind any future adapter (DSH, openJiuwen, or other):
+
+1. **Declared at boot, validated before state.** An adapter statically
+   declares which ports it implements, what it depends on, and a config
+   schema. Boot validates the declaration and fails loudly before any task
+   state is read or written.
+2. **Registrations are effects.** Every lock, sink, listener, or daemon a
+   registration creates registers a disposer with a teardown registry;
+   shutdown runs the disposers in reverse registration order. Unload leaves
+   no residue — no stale lifetime locks, no orphaned notifications (#37).
+3. **Provider-visible implies logged.** Nothing reaches an inference
+   provider that cannot be reconstructed from the activity log. EgressGuard
+   makes this structural; the egress tripwire test makes it checked. A new
+   egress field must be whitelisted in docs/design/egress.md and pinned by
+   that test first.
+4. **Typed errors across the seam.** Port errors are typed values
+   (`FetchError` variants). Core never matches on error prose, and adapter
+   results are mapped into core types — no string passthrough.
 
 ## Ports
 

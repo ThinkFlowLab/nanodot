@@ -8,6 +8,7 @@ degrade, never crash.
 
 from __future__ import annotations
 
+import http.client
 import json
 import urllib.error
 import urllib.request
@@ -89,7 +90,10 @@ class APIInferenceProvider(InferenceProvider):
         except urllib.error.HTTPError as error:
             detail = self._scrub(error.read().decode(errors="replace"))[:200]
             raise ProviderError(f"model API error {error.code}: {detail}") from error
-        except (urllib.error.URLError, TimeoutError, OSError, ValueError) as error:
+        except (urllib.error.URLError, TimeoutError, OSError, ValueError,
+                http.client.HTTPException) as error:
+            # HTTPException (e.g. IncompleteRead on a truncated body) is a
+            # routine transport failure, not an unhandled adapter error.
             raise ProviderError(self._scrub(f"model API unreachable: {error}")) from error
         try:
             content = payload["choices"][0]["message"]["content"]

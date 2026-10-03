@@ -305,17 +305,20 @@ def test_runner_policy_changes_require_stopped_runner(
 
 def test_runner_loads_policy_under_lock_before_ready(home: Path) -> None:
     from nanodot.cli import _wiring
+    from nanodot.core.teardown import Teardown
 
-    def checked_wiring():
+    def checked_wiring(teardown=None):
         assert not (home / "runner.pid").exists()
         with pytest.raises(RunnerAlreadyRunning):
             with configuration_lock(home / "runner.pid"):
                 pytest.fail("runner read configuration before acquiring ownership")
-        return _wiring()
+        return _wiring(teardown)
 
     with mock.patch("nanodot.cli._wiring", side_effect=checked_wiring) as wiring:
         assert main(["runner", "--once"]) == 0
-    wiring.assert_called_once_with()
+    wiring.assert_called_once()
+    (passed,), kwargs = wiring.call_args
+    assert isinstance(passed, Teardown) and not kwargs
 
 
 def test_background_start_does_not_report_ready_with_invalid_policy(home: Path, capsys) -> None:

@@ -7,7 +7,7 @@ from enum import Enum
 from nanodot.ports.github import CheckRun, Snapshot
 
 PASSING_CONCLUSIONS = frozenset({"success"})
-FAILING_CONCLUSIONS = frozenset({"failure", "timed_out", "cancelled", "action_required", "stale", "error"})
+FAILING_CONCLUSIONS = frozenset({"failure", "timed_out", "cancelled", "action_required", "stale", "startup_failure", "error"})
 IGNORED_CONCLUSIONS = frozenset({"skipped", "neutral"})
 
 
