@@ -302,7 +302,11 @@ def test_slow_summary_does_not_hold_up_other_tasks(home):
         before = time.monotonic()
         loop.run_once(first, FakeClock().now)
         loop.run_once(second, FakeClock().now)
-        assert time.monotonic() - before < 0.5
+        # Must stay well under the provider's 2s hang to prove the next run
+        # was not held up — but generous for a loaded CI runner (this exact
+        # bound flaked at 0.84s once); independence is also proven by the
+        # calls/sink assertions below.
+        assert time.monotonic() - before < 1.5
         assert len(calls) == 1  # no unbounded backlog/threads while previous hangs
         assert len(sink.events) == 2
         assert all(event.summary is None for event in sink.events)

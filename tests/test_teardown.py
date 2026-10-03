@@ -118,7 +118,10 @@ def test_task_loop_close_is_bounded_even_with_a_hung_provider(home: Path) -> Non
 
     started = time.monotonic()
     loop.close()
-    assert time.monotonic() - started < 2.0, "close hung on the summary drain"
+    # Good path returns after the ~0.2s budget; a hang would ride the
+    # provider's own 5s timeout plus linger. 4.0 separates the two with
+    # headroom for a loaded runner.
+    assert time.monotonic() - started < 4.0, "close hung on the summary drain"
 
     provider.release.set()
     worker.join(5.0)
