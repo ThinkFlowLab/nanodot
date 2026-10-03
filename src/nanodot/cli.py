@@ -200,7 +200,8 @@ def _run_config(args: argparse.Namespace) -> int:
     # successful change while an existing runner would keep the old policy.
     if (
         args.config_command in ("set", "unset")
-        and args.name in {"github-auth-mode", "os-notifications"}
+        and args.name in {"github-auth-mode", "os-notifications",
+                          "permission-mode", "mode"}
     ):
         from nanodot.native.runner_control import (
             RunnerAlreadyRunning, RunnerControlError, configuration_lock,
@@ -241,6 +242,30 @@ def _run_config_values(args: argparse.Namespace) -> int:
         if value is None or (is_secret_name(args.name) and not value):
             print("error: a nonempty value is required", file=sys.stderr)
             return 1
+        if args.name == "github-write-token":
+            # Set-time validation, fail closed: nothing is stored unless the
+            # credential is separate from the read token and GitHub accepts
+            # it (read-only probe; #52).
+            from nanodot.native.github_writer import probe_write_token
+            from nanodot.ports.github_writer import WriteError
+
+            read_token = store.get("github-token")
+            if read_token is not None and value == read_token:
+                print(
+                    "error: the write token must be a separate credential, "
+                    "not the read token",
+                    file=sys.stderr,
+                )
+                return 1
+            try:
+                probe_write_token(value)
+            except WriteError as error:
+                print(
+                    f"error: {error}; nothing stored — configure a valid "
+                    "fine-grained write token (comment-write, single repo)",
+                    file=sys.stderr,
+                )
+                return 1
         if is_secret_name(args.name):
             try:
                 store.set(args.name, value)

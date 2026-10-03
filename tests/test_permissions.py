@@ -137,7 +137,7 @@ def test_gated_mode_is_settable_and_admits_only_the_comment_action(home: Path) -
 
 
 def test_auto_mode_is_rejected_and_never_enables_writes(home: Path) -> None:
-    with pytest.raises(ValueError, match="not implemented"):
+    with pytest.raises(ValueError, match="not an enabled permission mode"):
         Config().set("mode", "auto")
     # Pre-existing or manually edited configuration cannot bypass the gate.
     home.mkdir(parents=True, exist_ok=True)

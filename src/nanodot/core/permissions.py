@@ -164,10 +164,14 @@ class PermissionCenter:
     # -- mode ---------------------------------------------------------------
 
     def mode(self) -> Mode:
+        # Canonical key first; "mode" remains readable for pre-rename installs.
         try:
-            mode = Mode(str(Config().get("mode", Mode.READONLY.value)))
+            configured = Config().get("permission-mode")
+            if configured is None:
+                configured = Config().get("mode", Mode.READONLY.value)
+            mode = Mode(str(configured))
         except ValueError:
-            return Mode.READONLY
+            return Mode.READONLY  # unknown or hand-edited value: fail closed
         if mode is Mode.AUTO:
             raise ValueError(
                 "mode 'auto' is not supported; only readonly and gated are available"

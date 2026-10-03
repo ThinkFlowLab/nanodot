@@ -23,6 +23,9 @@ from nanodot.paths import data_home
 CONFIG_FILE = "config.json"
 
 
+MODE_KEYS = ("permission-mode", "mode")  # canonical name first; mode is legacy
+
+
 def _validated_value(key: str, value: object) -> object:
     if key == "github-auth-mode" and value not in ("token", "anonymous"):
         raise ValueError("github-auth-mode must be token or anonymous")
@@ -88,8 +91,15 @@ class Config:
         return _validated_value(key, values[key])
 
     def set(self, key: str, value: object) -> None:
-        if key == "mode" and value not in ("readonly", "gated"):
-            raise ValueError("mode must be readonly or gated; auto is not implemented")
+        # Mode keys validate at set time only: a hand-edited file fails
+        # closed at load (PermissionCenter.mode), never crashes the runner.
+        if key in MODE_KEYS:
+            if value == "auto":
+                raise ValueError(
+                    "auto is not an enabled permission mode; use gated or readonly"
+                )
+            if value not in ("readonly", "gated"):
+                raise ValueError(f"{key} must be readonly or gated")
         value = _validated_value(key, value)
         with _exclusive_lock(self._lock):
             values = self._read()
