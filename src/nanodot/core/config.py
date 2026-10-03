@@ -88,8 +88,8 @@ class Config:
         return _validated_value(key, values[key])
 
     def set(self, key: str, value: object) -> None:
-        if key == "mode" and value != "readonly":
-            raise ValueError("only readonly mode is available; gated/auto modes are not implemented")
+        if key == "mode" and value not in ("readonly", "gated"):
+            raise ValueError("mode must be readonly or gated; auto is not implemented")
         value = _validated_value(key, value)
         with _exclusive_lock(self._lock):
             values = self._read()

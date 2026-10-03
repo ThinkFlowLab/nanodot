@@ -34,8 +34,12 @@ from nanodot.ports.github_writer import (
 API_BASE = "https://api.github.com"
 WRITE_TOKEN_SECRET = "github-write-token"
 
-# action -> (verb, path template); the first real entries land with #54.
+# action -> (verb, path template). The first real action is `comment`
+# (docs/design/github-writer.md §A6); further entries land with their issues.
 ActionTable = dict[str, tuple[str, str]]
+DEFAULT_ACTIONS: ActionTable = {
+    "comment": ("POST", "/repos/{owner}/{repo}/issues/{number}/comments"),
+}
 
 
 def _resolve(template: str, target: PRTarget) -> str:
@@ -60,7 +64,7 @@ class GitHubWriter:
     ) -> None:
         self._token = token
         self._base_url = base_url.rstrip("/")
-        self._actions = actions if actions is not None else {}
+        self._actions = actions if actions is not None else DEFAULT_ACTIONS
         self._timeout = timeout
 
     def _write_token(self) -> str:

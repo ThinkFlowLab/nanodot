@@ -17,6 +17,7 @@ from nanodot.core.activity import ActivityLog
 from nanodot.core.memory import MemoryStore
 from nanodot.core.statemachine import WatchEvent
 from nanodot.core.tasks import Task, TaskError, TaskState, TaskStore
+from nanodot.core.write_flow import WriteFlow
 from nanodot.ports.github import (
     AuthLostError,
     FetchError,
@@ -134,6 +135,7 @@ class TaskLoop:
         provider: InferenceProvider | None = None,
         memory: MemoryStore | None = None,
         summary_budget_seconds: float = SUMMARY_BUDGET_SECONDS,
+        write: WriteFlow | None = None,
     ) -> None:
         self._store = store
         self._fetcher = fetcher
@@ -141,6 +143,7 @@ class TaskLoop:
         self._activity = activity
         self._provider = provider
         self._memory = memory
+        self._write = write
         self._summary_budget_seconds = summary_budget_seconds
         self._summaries = _SummaryBudget(summary_budget_seconds)
         self._locks: dict[str, threading.Lock] = {}
@@ -239,6 +242,16 @@ class TaskLoop:
         )
 
     def _run_locked(self, task: Task, now: float) -> RunOutcome:
+        # Writes precede fetching: an approved capability executes even if
+        # this poll later fails, and recovery surfaces crash doubts first.
+        if self._write is not None:
+            for event in self._write.recover(task, now):
+                self._sink.notify(event)
+            for event in self._write.execute_pending(
+                task, now, superseded=lambda: bool(self._superseded(task))
+            ):
+                self._sink.notify(event)
+
         try:
             snapshot = self._fetcher.fetch(task.target)
         except (AuthLostError, PRNotFoundError) as error:
@@ -302,6 +315,14 @@ class TaskLoop:
                 if summary:
                     event = replace(event, summary=summary)
                 self._sink.notify(event)
+
+        # In gated mode a failure event proposes one comment for human
+        # approval — content-bound, never sent without it.
+        if self._write is not None:
+            for event in events:
+                proposed = self._write.propose_write(task, event)
+                if proposed is not None:
+                    self._sink.notify(proposed)
 
         terminal = any(event.terminal for event in events)
         if terminal:

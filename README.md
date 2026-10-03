@@ -128,6 +128,19 @@ scope change records nothing. Replaying the log reproduces every stop/notify
 decision without re-asking GitHub. The default `nanodot activity` view hides
 per-poll observations so events stay readable; pass `--all` to include them.
 
+### Gated writes: proposed, never sent without your approval
+
+In addition to the default `readonly` mode, `gated` mode lets the watcher
+propose one external action — a comment on the PR it watches, rule-drafted
+from observed check failures. A proposal lands in the inbox with its exact
+content; nothing is sent until you run `nanodot approvals approve
+<request-id>`. Approval issues a single-use, content-bound capability:
+the bytes at the HTTP boundary must hash-match what you approved, and a
+crash mid-write surfaces as unknown in the inbox and is never blindly
+re-sent. Gated mode requires a separate write token
+(`nanodot config set github-write-token`); the read token never gains
+write reach. `auto` mode does not exist: no standing write grants.
+
 ### Fixed watch policy
 
 This MVP supports a fixed, validated policy. It notifies on new commits, check

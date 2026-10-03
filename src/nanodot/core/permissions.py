@@ -1,16 +1,20 @@
-"""Permissions — ZCode-style (issue #1 review, 2026-09-30).
+"""Permissions — ZCode-style (issue #1 review, 2026-09-30; writer port #59).
 
-Named modes with `readonly` as the enforced MVP default; approvals are
-persisted, inspectable, revocable grants scoped to action type + target +
-scope + expiry; silence is never approval (unanswered requests expire and
-the task stays blocked); denials are recorded; grants are invalidated when
-task scope changes. The MVP exposes only read-only GitHub operations;
-assert_allowed also denies every external write action. Gated and automatic
-modes are placeholders and cannot enable actions or bypass this gate.
+Named modes: `readonly` (the default) and `gated` (writes only through a
+content-bound, single-use capability). Approvals are persisted,
+inspectable, revocable grants scoped to action type + target + scope +
+content hash + expiry; silence is never approval (unanswered requests
+expire and the task stays blocked); denials are recorded; grants are
+invalidated when task scope changes. `auto` remains a rejected
+placeholder. In readonly mode `assert_allowed` denies every external
+write action; in gated mode it admits exactly the implemented write
+actions, and execution still requires a capability that only
+`approve()` — called from the CLI — can issue.
 """
 
 from __future__ import annotations
 
+import json
 import sqlite3
 import threading
 import time
@@ -21,6 +25,7 @@ from pathlib import Path
 
 from nanodot.core.config import Config
 from nanodot.paths import database_path
+from nanodot.ports.github_writer import WriteCapability, payload_digest
 
 DEFAULT_REQUEST_TTL_SECONDS = 24 * 3600
 
@@ -31,11 +36,13 @@ class WriteForbidden(PermissionError):
 
 class Mode(str, Enum):
     READONLY = "readonly"
-    GATED = "gated"  # designed, dormant: write actions would pause for approval
+    GATED = "gated"  # writes pause for approval; the capability is the gate
     AUTO = "auto"    # designed, dormant: pre-granted scoped capabilities only
 
 
 READ_ACTIONS = frozenset({"read"})
+# The one implemented write action (docs/design/github-writer.md §A6).
+GATED_WRITE_ACTIONS = frozenset({"comment"})
 
 
 @dataclass(frozen=True)
@@ -48,6 +55,7 @@ class Grant:
     created_at: float
     expires_at: float | None
     revoked_at: float | None
+    content_hash: str = ""  # the exact payload this grant authorizes
 
 
 @dataclass(frozen=True)
@@ -60,7 +68,8 @@ class ApprovalRequest:
     created_at: float
     expires_at: float
     state: str  # pending | approved | denied | expired
-
+    content_hash: str = ""  # binds the exact payload a write may send
+    content: str = ""  # the payload the user saw when approving
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS grants (
@@ -71,7 +80,8 @@ CREATE TABLE IF NOT EXISTS grants (
   task_id TEXT NOT NULL,
   created_at REAL NOT NULL,
   expires_at REAL,
-  revoked_at REAL
+  revoked_at REAL,
+  content_hash TEXT NOT NULL DEFAULT ''
 );
 CREATE TABLE IF NOT EXISTS requests (
   id TEXT PRIMARY KEY,
@@ -81,9 +91,29 @@ CREATE TABLE IF NOT EXISTS requests (
   task_id TEXT NOT NULL,
   created_at REAL NOT NULL,
   expires_at REAL NOT NULL,
-  state TEXT NOT NULL
+  state TEXT NOT NULL,
+  content_hash TEXT NOT NULL DEFAULT '',
+  content TEXT NOT NULL DEFAULT ''
+);
+CREATE TABLE IF NOT EXISTS capabilities (
+  grant_id TEXT PRIMARY KEY,
+  action TEXT NOT NULL,
+  target TEXT NOT NULL,
+  content_hash TEXT NOT NULL,
+  content TEXT NOT NULL,
+  issued_at REAL NOT NULL,
+  used_at REAL
 );
 """
+
+
+def _ensure_column(connection: sqlite3.Connection, table: str, ddl: str) -> None:
+    """Additive migration for pre-writer databases (fail closed: legacy
+    rows keep an empty hash, which can never match a real payload)."""
+    column = ddl.split()[0]
+    columns = {row["name"] for row in connection.execute(f"PRAGMA table_info({table})")}
+    if column not in columns:
+        connection.execute(f"ALTER TABLE {table} ADD COLUMN {ddl}")
 
 
 def invalidate_task_grants(
@@ -126,6 +156,9 @@ class PermissionCenter:
         self._conn.row_factory = sqlite3.Row
         with self._lock:
             self._conn.executescript(_SCHEMA)
+            _ensure_column(self._conn, "grants", "content_hash TEXT NOT NULL DEFAULT ''")
+            _ensure_column(self._conn, "requests", "content_hash TEXT NOT NULL DEFAULT ''")
+            _ensure_column(self._conn, "requests", "content TEXT NOT NULL DEFAULT ''")
             self._conn.commit()
 
     # -- mode ---------------------------------------------------------------
@@ -135,21 +168,27 @@ class PermissionCenter:
             mode = Mode(str(Config().get("mode", Mode.READONLY.value)))
         except ValueError:
             return Mode.READONLY
-        if mode is not Mode.READONLY:
+        if mode is Mode.AUTO:
             raise ValueError(
-                f"mode {mode.value!r} is not supported; only readonly mode is available"
+                "mode 'auto' is not supported; only readonly and gated are available"
             )
         return mode
 
     def assert_allowed(self, action: str) -> None:
-        """The gate every external action must pass. In the read-only MVP
-        this raises for any non-read action — there are no write paths."""
+        """The gate every external action must pass. Readonly admits reads
+        only; gated additionally admits exactly the implemented write
+        actions — a grant or capability is still required to execute.
+        An unsupported mode denies as WriteForbidden: fail closed."""
         if action in READ_ACTIONS:
             return
-        # Gated/auto are design placeholders, not implemented capabilities.
-        # Neither configuration nor a stored grant can enable MVP write paths.
+        try:
+            mode = self.mode()
+        except ValueError as error:
+            raise WriteForbidden(str(error)) from error
+        if mode is Mode.GATED and action in GATED_WRITE_ACTIONS:
+            return
         raise WriteForbidden(
-            f"action {action!r} is a write; only readonly mode is supported"
+            f"action {action!r} is not an available action in the current mode"
         )
 
     # -- requests -----------------------------------------------------------
@@ -160,11 +199,14 @@ class PermissionCenter:
         target: str,
         scope: str,
         task_id: str,
+        content: dict | None = None,
         ttl: float = DEFAULT_REQUEST_TTL_SECONDS,
     ) -> ApprovalRequest:
-        """Record what action is wanted, showing action/target/scope/effect.
-        Silence never approves: it expires."""
+        """Record what action is wanted, binding the exact payload a write
+        may send (canonical JSON shared with the wire). Silence never
+        approves: it expires."""
         now = self._clock.time()
+        stored = payload_digest(content) if content is not None else ""
         req = ApprovalRequest(
             id=uuid.uuid4().hex[:12],
             action=action,
@@ -174,21 +216,25 @@ class PermissionCenter:
             created_at=now,
             expires_at=now + ttl,
             state="pending",
+            content_hash=stored,
+            content=json.dumps(content, sort_keys=True, separators=(",", ":")) if content is not None else "",
         )
         with self._lock:
             self._conn.execute(
-                "INSERT INTO requests VALUES (?,?,?,?,?,?,?,?)",
+                "INSERT INTO requests VALUES (?,?,?,?,?,?,?,?,?,?)",
                 (
                     req.id, req.action, req.target, req.scope, req.task_id,
                     req.created_at, req.expires_at, req.state,
+                    req.content_hash, req.content,
                 ),
             )
             self._conn.commit()
         return req
 
-    def approve(self, request_id: str) -> Grant:
+    def approve(self, request_id: str) -> WriteCapability:
         """Approval creates a grant scoped to exactly this action + target +
-        scope, with an expiry. Nothing broader."""
+        scope + content hash, with an expiry — and issues the single-use
+        capability the writer port requires. Nothing broader."""
         with self._lock:
             # Reserve the write before checking the request, so another
             # connection cannot approve it twice or change its task's scope
@@ -204,8 +250,9 @@ class PermissionCenter:
                     if req.state == "expired":
                         raise ValueError("request expired — silence is not approval; re-request")
                     raise ValueError(f"request is already {req.state}")
+                grant_id = uuid.uuid4().hex[:12]
                 grant = Grant(
-                    id=uuid.uuid4().hex[:12],
+                    id=grant_id,
                     action=req.action,
                     target=req.target,
                     scope=req.scope,
@@ -213,18 +260,83 @@ class PermissionCenter:
                     created_at=now,
                     expires_at=req.expires_at,
                     revoked_at=None,
+                    content_hash=req.content_hash,
                 )
                 self._conn.execute(
                     "UPDATE requests SET state='approved' WHERE id=?", (request_id,)
                 )
                 self._conn.execute(
-                    "INSERT INTO grants VALUES (?,?,?,?,?,?,?,?)",
+                    "INSERT INTO grants VALUES (?,?,?,?,?,?,?,?,?)",
                     (
                         grant.id, grant.action, grant.target, grant.scope,
-                        grant.task_id, grant.created_at, grant.expires_at, None,
+                        grant.task_id, grant.created_at, grant.expires_at,
+                        None, grant.content_hash,
                     ),
                 )
-        return grant
+                self._conn.execute(
+                    "INSERT INTO capabilities VALUES (?,?,?,?,?,?,NULL)",
+                    (
+                        grant.id, req.action, req.target, req.content_hash,
+                        req.content, now,
+                    ),
+                )
+        return WriteCapability(
+            action=req.action,
+            target=req.target,
+            content_hash=req.content_hash,
+            grant_id=grant_id,
+        )
+
+    # -- capabilities --------------------------------------------------------
+
+    def consume(self, grant_id: str) -> bool:
+        """Atomically mark a capability used. True exactly once per
+        capability — a lost race (or a replay after restart) returns False
+        and the caller must not send."""
+        with self._lock, self._conn:
+            self._conn.execute("BEGIN IMMEDIATE")
+            cursor = self._conn.execute(
+                "UPDATE capabilities SET used_at=? "
+                "WHERE grant_id=? AND used_at IS NULL",
+                (self._clock.time(), grant_id),
+            )
+            return cursor.rowcount == 1
+
+    def pending_capabilities(self, task_id: str) -> list[tuple[WriteCapability, str]]:
+        """Unconsumed, unrevoked, unexpired capabilities for a task, with
+        the exact approved content to send."""
+        at = self._clock.time()
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT c.* FROM capabilities c JOIN grants g ON c.grant_id = g.id "
+                "WHERE g.task_id=? AND c.used_at IS NULL "
+                "AND g.revoked_at IS NULL "
+                "AND (g.expires_at IS NULL OR g.expires_at > ?) "
+                "ORDER BY c.issued_at",
+                (task_id, at),
+            ).fetchall()
+        return [
+            (
+                WriteCapability(
+                    action=row["action"], target=row["target"],
+                    content_hash=row["content_hash"], grant_id=row["grant_id"],
+                ),
+                json.loads(row["content"]) if row["content"] else {},
+            )
+            for row in rows
+        ]
+
+    def has_verbatim_request(self, task_id: str, content_hash: str) -> str | None:
+        """The state of an earlier request for this exact content, if any —
+        a denial is never re-asked verbatim, and a pending one is not
+        duplicated."""
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT state FROM requests WHERE task_id=? AND content_hash=? "
+                "ORDER BY created_at DESC LIMIT 1",
+                (task_id, content_hash),
+            ).fetchone()
+        return row["state"] if row else None
 
     def deny(self, request_id: str) -> None:
         """A denial is an answer: recorded, never re-asked verbatim."""
@@ -344,6 +456,8 @@ class PermissionCenter:
             created_at=row["created_at"],
             expires_at=row["expires_at"],
             state=row["state"],
+            content_hash=row["content_hash"],
+            content=row["content"],
         )
 
     @staticmethod

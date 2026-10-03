@@ -126,17 +126,26 @@ def test_unknown_mode_falls_back_to_readonly(home: Path) -> None:
     assert PermissionCenter().mode() is Mode.READONLY
 
 
-@pytest.mark.parametrize("mode", ["gated", "auto"])
-def test_dormant_modes_are_rejected_and_never_enable_writes(home: Path, mode: str) -> None:
-    with pytest.raises(ValueError, match="only readonly"):
-        Config().set("mode", mode)
+def test_gated_mode_is_settable_and_admits_only_the_comment_action(home: Path) -> None:
+    Config().set("mode", "gated")
+    center = PermissionCenter()
+    assert center.mode() is Mode.GATED
+    center.assert_allowed("read")
+    center.assert_allowed("comment")  # the one implemented write action
+    with pytest.raises(WriteForbidden):
+        center.assert_allowed("merge")  # unimplemented writes fail closed
+
+
+def test_auto_mode_is_rejected_and_never_enables_writes(home: Path) -> None:
+    with pytest.raises(ValueError, match="not implemented"):
+        Config().set("mode", "auto")
     # Pre-existing or manually edited configuration cannot bypass the gate.
     home.mkdir(parents=True, exist_ok=True)
-    (home / "config.json").write_text(json.dumps({"mode": mode}))
+    (home / "config.json").write_text(json.dumps({"mode": "auto"}))
     center = PermissionCenter()
     with pytest.raises(ValueError, match="not supported"):
         center.mode()
-    with pytest.raises(WriteForbidden, match="only readonly"):
+    with pytest.raises(WriteForbidden):
         center.assert_allowed("merge")
     center.assert_allowed("read")
 
@@ -175,8 +184,8 @@ def test_expired_grant_does_not_permit(home: Path) -> None:
 
 def test_revoked_grant_does_not_permit(home: Path) -> None:
     center = PermissionCenter(clock=FakeClock())
-    grant = _approved_grant(center)
-    center.revoke(grant.id)
+    capability = _approved_grant(center)
+    center.revoke(capability.grant_id)
     assert not center.permits("rerun", "owner/repo#1", "failed-checks")
     assert center.grants(active_only=True) == []
 

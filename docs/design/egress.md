@@ -34,6 +34,20 @@ provider; the API key travels only in the `Authorization` header. A local
 model behind the same interface removes this egress entirely — no other
 code changes.
 
+## 3. GitHub writes (the writer port, gated mode)
+
+Only in gated mode, and only behind a content-bound, single-use
+capability issued by a human approval (`nanodot approvals approve`):
+
+- **Destination:** `api.github.com` (a comment POST on the watched PR).
+- **Content:** exactly the approved payload bytes — the native writer
+  verifies the capability's SHA-256 against the body before sending;
+  a mismatch sends nothing.
+- **Credential:** the separate `github-write-token` travels only in the
+  writer's `Authorization` header. It never reaches the fetch client,
+  logs, memory, inbox, or summaries; the read token never reaches the
+  writer. A durable `write-intent` activity record precedes every send.
+
 Everything else — scheduling, state transitions, commit-pinning, dedup,
 memory writes, redaction — happens locally.
 
