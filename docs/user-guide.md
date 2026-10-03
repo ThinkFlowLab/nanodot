@@ -273,6 +273,12 @@ denial. `readonly` (`nanodot config set permission-mode readonly`)
 proposes and sends nothing. All writes additionally require
 `nanodot config set github-write-token`.
 
+Every write mode is budget-bound: a watch may issue at most 3 comments,
+3 labels, and 1 review approval per day by default. When a budget is
+exhausted, `nanodot activity <task-id>` shows a single `quota-exhausted`
+entry and the action is not attempted again until the next day — the
+watch itself keeps running.
+
 ## Troubleshooting usage
 
 | Symptom | Next step |
