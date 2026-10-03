@@ -114,14 +114,18 @@ class WriteQuota:
             self._conn.commit()
 
     def limit_for(self, action: str, watch_id: str) -> int:
-        row = self._conn.execute(
-            "SELECT daily_limit FROM write_quota_overrides "
-            "WHERE watch_id=? AND action=?",
-            (watch_id, action),
-        ).fetchone()
-        if row is not None:
-            return int(row["daily_limit"])
-        return self._limits.get(action, 0)  # unknown action: fail closed
+        # Reads take the same lock as writes: the CLI may set an override
+        # while the runner is checking, and one locking discipline for the
+        # shared connection is cheaper to reason about than two.
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT daily_limit FROM write_quota_overrides "
+                "WHERE watch_id=? AND action=?",
+                (watch_id, action),
+            ).fetchone()
+            if row is not None:
+                return int(row["daily_limit"])
+            return self._limits.get(action, 0)  # unknown action: fail closed
 
     # -- the budget -----------------------------------------------------------
 
@@ -130,12 +134,13 @@ class WriteQuota:
 
     def consumed(self, action: str, watch_id: str, now: float) -> int:
         day = self._day(now)
-        row = self._conn.execute(
-            "SELECT count(*) AS n FROM write_quota "
-            "WHERE action=? AND watch_id=? AND day=?",
-            (action, watch_id, day),
-        ).fetchone()
-        return int(row["n"])
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT count(*) AS n FROM write_quota "
+                "WHERE action=? AND watch_id=? AND day=?",
+                (action, watch_id, day),
+            ).fetchone()
+            return int(row["n"])
 
     def check(self, action: str, watch_id: str, now: float) -> QuotaDecision:
         """Read-only: may this action still be attempted right now?"""

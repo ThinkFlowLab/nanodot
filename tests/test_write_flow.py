@@ -486,7 +486,7 @@ def test_replay_shows_the_full_write_trail(home: Path) -> None:
 # -- 11. read purity ---------------------------------------------------------------
 
 
-def test_fetch_neever_sees_the_write_token(home: Path) -> None:
+def test_fetch_never_sees_the_write_token(home: Path) -> None:
     FileSecretStore().set("github-token", "ghp_read_token")
     FileSecretStore().set("github-write-token", "ghp_write_should_not_leak")
     requests_seen: list[urllib.request.Request] = []

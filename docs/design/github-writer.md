@@ -38,6 +38,10 @@ capability — by construction, not convention.
    re-sent blindly; surfaced in the inbox; optionally reconciled via the
    read port (author + time-window + content-prefix search). This mirrors
    commit-pinning: uncertainty is admitted, never papered over.
+   Known microsecond window (accepted): a crash between the single-use
+   consume and the intent append burns the capability with no record —
+   two adjacent local SQLite writes; the approval is lost silently in
+   exactly that window and nowhere else.
 6. **First action: a comment on a watched PR**, rule-drafted from evidence
    already in hand (no model coupling — model drafting is a separate,
    explicit egress decision). Merge and release are out of scope;
