@@ -150,6 +150,9 @@ class Demo:
     def run(self) -> dict:
         self.cli("config", "set", "github-auth-mode", "anonymous")
         self.cli("config", "set", "os-notifications", "false")
+        # This walkthrough is the read-only first use: no writes are proposed,
+        # skipped, or auto-authorized (auto is the installed default mode).
+        self.cli("config", "set", "permission-mode", "readonly")
         self.cli("watch", "add", TARGET, "--yes", "--cadence", "300")
         task_id = self.rows("tasks")[0]["id"]
         self.cli("watch", "show", task_id)

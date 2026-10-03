@@ -93,13 +93,8 @@ class Config:
     def set(self, key: str, value: object) -> None:
         # Mode keys validate at set time only: a hand-edited file fails
         # closed at load (PermissionCenter.mode), never crashes the runner.
-        if key in MODE_KEYS:
-            if value == "auto":
-                raise ValueError(
-                    "auto is not an enabled permission mode; use gated or readonly"
-                )
-            if value not in ("readonly", "gated"):
-                raise ValueError(f"{key} must be readonly or gated")
+        if key in MODE_KEYS and value not in ("readonly", "gated", "auto"):
+            raise ValueError(f"{key} must be readonly, gated, or auto")
         value = _validated_value(key, value)
         with _exclusive_lock(self._lock):
             values = self._read()

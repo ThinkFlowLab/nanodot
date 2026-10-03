@@ -144,8 +144,9 @@ def test_probe_read_only_and_typed_errors(monkeypatch) -> None:
 # -- permission-mode: canonical key, legacy fallback, fail-closed load ----------
 
 
-def test_permission_mode_defaults_to_readonly(home: Path) -> None:
-    assert PermissionCenter().mode() is Mode.READONLY
+def test_permission_mode_defaults_to_auto(home: Path) -> None:
+    # #48 decision 5: auto is the default — inert without grants/write token.
+    assert PermissionCenter().mode() is Mode.AUTO
 
 
 def test_permission_mode_canonical_key_and_legacy_fallback(home: Path) -> None:
@@ -158,19 +159,20 @@ def test_permission_mode_canonical_key_and_legacy_fallback(home: Path) -> None:
     assert PermissionCenter().mode() is Mode.GATED
 
 
-def test_permission_mode_rejects_auto_and_garbage(home: Path) -> None:
-    with pytest.raises(ValueError, match="not an enabled permission mode"):
-        Config().set("permission-mode", "auto")
-    with pytest.raises(ValueError, match="must be readonly or gated"):
+def test_permission_mode_accepts_auto_and_rejects_garbage(home: Path) -> None:
+    Config().set("permission-mode", "auto")
+    assert PermissionCenter().mode() is Mode.AUTO
+    with pytest.raises(ValueError, match="must be readonly, gated, or auto"):
         Config().set("permission-mode", "yolo")
-    with pytest.raises(ValueError, match="not an enabled permission mode"):
-        Config().set("mode", "auto")
+    Config().set("mode", "auto")  # the legacy key accepts it too
+    assert PermissionCenter().mode() is Mode.AUTO
 
 
 def test_readonly_hard_off_with_write_token_configured(
     home: Path, monkeypatch
 ) -> None:
     set_write_token(monkeypatch, probe=lambda token: {"login": "me"})
+    Config().set("permission-mode", "readonly")  # mode is never token-derived
     center = PermissionCenter()
     assert center.mode() is Mode.READONLY
     with pytest.raises(WriteForbidden):
