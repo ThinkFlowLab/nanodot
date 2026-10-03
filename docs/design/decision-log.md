@@ -12,6 +12,10 @@ The activity log records what the runner observed, not just what changed.
   `pending_reason` (`statemachine.step`).
 - Entries written at the same second replay in insertion order
   (observe → decide → act).
+- Observations also carry `rate_limit_remaining`, the tightest GitHub
+  quota the fetch saw — the one resource the watcher consumes. Advisory
+  only: fingerprints and events ignore it, so it never affects dedup or
+  notifications.
 
 Decisions are deterministic given `(task, snapshot, clock)`, so the log alone
 replays every stop/notify decision without re-asking GitHub — auditability as

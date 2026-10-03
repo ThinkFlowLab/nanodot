@@ -92,7 +92,11 @@ def observation(snapshot: Snapshot) -> dict:
     fingerprint that dedup keys on. Recorded every poll by the runner so a
     no-change poll is reconstructable and any decision is replayable from
     the log alone. Same whitelisted shape as event evidence."""
-    return {"fingerprint": _fingerprint(snapshot), **_checks_evidence(snapshot)}
+    return {
+        "fingerprint": _fingerprint(snapshot),
+        **_checks_evidence(snapshot),
+        "rate_limit_remaining": snapshot.rate_limit_remaining,
+    }
 
 
 def _event(

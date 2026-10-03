@@ -40,6 +40,10 @@ class Snapshot:
     url: str
     required_checks: tuple[RequiredCheck, ...] | None = None
     checks_complete: bool = False
+    # Advisory transport metadata (the tightest X-RateLimit-Remaining seen
+    # during the fetch). Never part of snapshot identity: fingerprints and
+    # events deliberately ignore it — only observations record it.
+    rate_limit_remaining: int | None = None
 
     def checks_for(self, sha: str) -> tuple[CheckRun, ...]:
         return tuple(run for run in self.checks if run.sha == sha)
