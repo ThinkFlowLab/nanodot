@@ -94,7 +94,13 @@ def build_parser() -> argparse.ArgumentParser:
     m_rm.add_argument("item_id")
 
     # -- approvals -----------------------------------------------------------
-    subparsers.add_parser("approvals", help="pending requests and grants")
+    approvals = subparsers.add_parser("approvals", help="pending requests and grants")
+    approvals_sub = approvals.add_subparsers(dest="approvals_command")
+    approvals_sub.add_parser("list", help="pending requests and grants")
+    a_approve = approvals_sub.add_parser("approve", help="approve a pending request")
+    a_approve.add_argument("request_id")
+    a_deny = approvals_sub.add_parser("deny", help="deny a pending request")
+    a_deny.add_argument("request_id")
 
     # -- activity / inbox --------------------------------------------------
     activity = subparsers.add_parser("activity", help="what actually ran")
@@ -121,9 +127,11 @@ def _wiring(teardown: Teardown | None = None) -> tuple:
     from nanodot.core.activity import ActivityLog
     from nanodot.core.config import Config
     from nanodot.core.memory import MemoryStore
+    from nanodot.core.permissions import Mode, PermissionCenter
     from nanodot.core.redaction import Redactor
     from nanodot.core.runner import TaskLoop
     from nanodot.core.tasks import TaskStore
+    from nanodot.core.write_flow import WriteFlow
     from nanodot.native.github_client import GitHubSnapshotFetcher
     from nanodot.native.inference_api import configured_provider
     from nanodot.native.notifier import NativeNotifier
@@ -155,9 +163,18 @@ def _wiring(teardown: Teardown | None = None) -> tuple:
         GitHubSnapshotFetcher(auth_mode=auth_mode)
         if auth_mode == "anonymous" else GitHubSnapshotFetcher()
     )
+    write = None
+    center = PermissionCenter()
+    own("permission-center", center.close)
+    if center.mode() is Mode.GATED:
+        from nanodot.native.github_writer import GitHubCommentWriter
+
+        write = WriteFlow(
+            center, GitHubCommentWriter(), activity, redactor=redactor,
+        )
     loop = TaskLoop(
         store, fetcher, sink, activity,
-        provider=configured_provider(), memory=memory,
+        provider=configured_provider(), memory=memory, write=write,
     )
     own("task-loop", loop.close)
     return secrets, store, activity, sink, fetcher, loop
@@ -492,16 +509,55 @@ def _print_memory_item(item) -> None:
     )
 
 
-def _run_approvals(_: argparse.Namespace) -> int:
+def _run_approvals(args: argparse.Namespace) -> int:
+    from nanodot.core.activity import ActivityLog
     from nanodot.core.permissions import PermissionCenter
+    from nanodot.core.redaction import Redactor
+    from nanodot.native.secrets_file import FileSecretStore
 
     center = PermissionCenter()
+    command = getattr(args, "approvals_command", None) or "list"
+
+    if command == "approve":
+        try:
+            capability = center.approve(args.request_id)
+        except ValueError as error:
+            print(f"error: {error}", file=sys.stderr)
+            return 1
+        activity = ActivityLog(redactor=Redactor(FileSecretStore()))
+        activity.append(
+            task_id=_capability_task(center, capability),
+            kind="write-approved",
+            message=(
+                f"approved {capability.action} on {capability.target}; "
+                "the runner executes it on the next tick"
+            ),
+            evidence={
+                "grant_id": capability.grant_id,
+                "action": capability.action,
+                "target": capability.target,
+                "content_hash": capability.content_hash,
+            },
+        )
+        print(f"approved {capability.action} on {capability.target}")
+        print(f"grant {capability.grant_id} (single use; expires with its request)")
+        return 0
+
+    if command == "deny":
+        try:
+            center.deny(args.request_id)
+        except ValueError as error:
+            print(f"error: {error}", file=sys.stderr)
+            return 1
+        print(f"denied {args.request_id} (never re-asked verbatim)")
+        return 0
+
     try:
         mode = center.mode()
     except ValueError as error:
         print(f"error: {error}", file=sys.stderr)
         return 1
-    print(f"mode: {mode.value} (read-only MVP: no external writes exist)")
+    print(f"mode: {mode.value}")
     pending = center.pending()
     print(f"pending approvals: {len(pending)}")
     for req in pending:
@@ -509,6 +565,9 @@ def _run_approvals(_: argparse.Namespace) -> int:
             f"  {req.id}  {req.action} on {req.target} ({req.scope}) "
             f"task={req.task_id}"
         )
+        if req.content:
+            preview = req.content if len(req.content) <= 200 else req.content[:197] + "..."
+            print(f"    content: {preview}")
     grants = center.grants(active_only=True)
     print(f"active grants: {len(grants)}")
     for grant in grants:
@@ -516,6 +575,14 @@ def _run_approvals(_: argparse.Namespace) -> int:
             f"  {grant.id}  {grant.action} on {grant.target} ({grant.scope})"
         )
     return 0
+
+
+def _capability_task(center: PermissionCenter, capability) -> str:
+    """The task a capability belongs to, for the activity trail."""
+    for grant in center.grants():
+        if grant.id == capability.grant_id:
+            return grant.task_id
+    return capability.grant_id
 
 
 # -- activity / inbox -----------------------------------------------------------
@@ -619,9 +686,24 @@ def _run_runner(args: argparse.Namespace) -> int:
 
 
 def _run_start(_: argparse.Namespace) -> int:
+    from nanodot.core.permissions import Mode, PermissionCenter
     from nanodot.native.runner_control import (
         RunnerControlError, running_pid, startup_lock,
     )
+    from nanodot.native.secrets_file import FileSecretStore
+
+    try:
+        gated = PermissionCenter().mode() is Mode.GATED
+    except ValueError as error:
+        print(f"error: {error}", file=sys.stderr)
+        return 1
+    if gated and not FileSecretStore().get("github-write-token"):
+        print(
+            "error: gated mode needs a write token — run: "
+            "nanodot config set github-write-token (hidden prompt)",
+            file=sys.stderr,
+        )
+        return 1
 
     try:
         with startup_lock(_pidfile()):

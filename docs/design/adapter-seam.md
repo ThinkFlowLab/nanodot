@@ -92,6 +92,18 @@ provide fakes; a future adapter would be another implementation.
   (mirrors, proxies, webhooks). Write operations are not part of this port
   in any implementation.
 
+### 2b. GitHub writer (gated mode only)
+
+- **Purpose:** execute one approved write — `execute(capability, body)`,
+    the Protocol's only method (frozen by test). A capability exists only
+    through `PermissionCenter.approve()` (CLI-only call sites, checked by
+    AST test) and is single-use, content-hash-bound, and scoped to the
+    watch's target. See `docs/design/github-writer.md`.
+- **Native implementation:** `GitHubCommentWriter` — a comment POST with
+    the separate write token; verifies the hash before sending.
+- **An adapter would implement:** another transport or identity (e.g. a
+    GitHub App) behind the same frozen Protocol — core never changes.
+
 ### 3. Notification sink
 
 - **Purpose:** deliver notable/terminal events to the user.

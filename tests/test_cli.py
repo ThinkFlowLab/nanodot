@@ -289,3 +289,40 @@ def test_activity_hides_observations_unless_all(
     assert main(["activity", task.id, "--all"]) == 0
     out = capsys.readouterr().out
     assert "check-observed" in out and "checks-failed" in out
+
+
+def test_approvals_approve_and_denied_never_reasked(
+    home: Path, token: str, capsys: pytest.CaptureFixture[str]
+) -> None:
+    from nanodot.core.permissions import PermissionCenter
+
+    center = PermissionCenter()
+    request = center.request(
+        action="comment", target=TARGET, scope="watch:s1",
+        task_id="task-1", content="the exact approved text",
+    )
+
+    assert main(["approvals", "list"]) == 0
+    out = capsys.readouterr().out
+    assert request.id in out and "the exact approved text" in out
+
+    assert main(["approvals", "approve", request.id]) == 0
+    out = capsys.readouterr().out
+    assert "approved comment" in out and "single use" in out
+
+    # The approval left an activity trail.
+    entries = ActivityLog().query(task_id="task-1", kinds=("write-approved",))
+    assert entries and entries[0].evidence["content_hash"]
+
+    # Denial of a second request is terminal: no verbatim re-ask.
+    second = center.request(
+        action="comment", target=TARGET, scope="watch:s1",
+        task_id="task-1", content="the exact approved text",
+    )
+    assert main(["approvals", "deny", second.id]) == 0
+    assert "denied" in capsys.readouterr().out
+    from nanodot.core.permissions import content_digest
+
+    assert center.has_verbatim_request(
+        "task-1", content_digest("the exact approved text")
+    ) == "denied"
