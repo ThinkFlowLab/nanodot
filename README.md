@@ -162,6 +162,14 @@ checks on head — even when nothing changed. The first digest fires only
 after one full interval; terminal, failing, paused, or cancelled ticks
 never digest; a crash-replay within a window cannot double-deliver.
 
+### Stale alerts
+
+`watch add --stale {2d,3d,7d,14d}` adds a once-per-commit idle alert: when a
+watched PR's head SHA sits unchanged for the configured days, exactly one
+notification fires (days idle, PR state, head, checks). A new commit re-arms
+it; terminal, failing, paused, or cancelled ticks never alert. Composes
+freely with `--digest`.
+
 ### Fixed watch policy
 
 This MVP supports a fixed, validated policy. It notifies on new commits, check

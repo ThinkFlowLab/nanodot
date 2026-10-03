@@ -33,6 +33,7 @@ PROLONGED_FAILURE_SECONDS = 3600
 SUMMARY_BUDGET_SECONDS = 1.0
 CHECK_OBSERVED = "check-observed"  # per-poll record of what the runner saw
 DIGEST = "digest"  # scheduled status heartbeat (issue #80)
+STALE = "stale"  # once-per-commit idle alert (issue #84)
 OBSERVATION_RETENTION = 20  # recent per-poll digests kept per task
 
 
@@ -333,6 +334,9 @@ class TaskLoop:
         if task.digest_interval_seconds is not None:
             if self._superseded(task) is None:
                 self._maybe_digest(task, snapshot, events, now)
+        if task.stale_after_seconds is not None:
+            if self._superseded(task) is None:
+                self._maybe_stale(task, snapshot, events, now)
 
         terminal = any(event.terminal for event in events)
         if terminal:
@@ -402,6 +406,50 @@ class TaskLoop:
             return
         self._record_event(digest)
         self._sink.notify(digest)
+
+    def _maybe_stale(self, task: Task, snapshot, events: list, now: float) -> None:
+        """Exactly one stale alert per head SHA: the idle clock arms on
+        every new commit, and the durable inbox dedups any replay."""
+        threshold = task.stale_after_seconds
+        assert threshold is not None  # caller-checked
+        state = task.watch_state
+        seen_at = state.get("sha_seen_at")
+        if state.get("sha_seen") != snapshot.head_sha:
+            state = dict(
+                state, sha_seen=snapshot.head_sha, sha_seen_at=now,
+                sha_stale_fired=False,
+            )
+            task.watch_state = state
+            return  # a fresh commit re-arms the window
+        if seen_at is None:
+            task.watch_state = dict(state, sha_seen_at=now)
+            return
+        if state.get("sha_stale_fired"):
+            return  # exactly once per commit, at the source
+        if any(event.terminal for event in events):
+            return  # the terminal notification already fires this tick
+        if now - float(seen_at) < threshold:
+            return
+        task.watch_state = dict(state, sha_stale_fired=True)
+        stale = WatchEvent(
+            kind=STALE,
+            message=(
+                f"stale: {task.target} has sat on {snapshot.head_sha[:10]} "
+                f"for {int((now - float(seen_at)) // 86400)} day(s) "
+                f"({snapshot.pr_state})"
+            ),
+            evidence={
+                **statemachine.observation(snapshot),
+                "rule": "notify: stale head",
+                "idle_days": int((now - float(seen_at)) // 86400),
+            },
+            notable=True,
+            task_id=task.id,
+            at=now,
+            occurrence=f"stale-{snapshot.head_sha[:10]}",
+        )
+        self._record_event(stale)
+        self._sink.notify(stale)
 
     def _prune_observations(self, task_id: str) -> None:
         """Retention is best-effort: a failing prune must not fail the run."""
