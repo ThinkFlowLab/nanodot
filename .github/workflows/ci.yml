@@ -30,3 +30,15 @@ jobs:
           export http_proxy="$HTTP_PROXY" https_proxy="$HTTPS_PROXY"
           export all_proxy="$ALL_PROXY" no_proxy="$NO_PROXY"
           python -m pytest -q
+      - name: Review skill checks
+        env:
+          # The skill suite is network-free by contract; hold it to the same
+          # dead-proxy enforcement as the main suite.
+          HTTP_PROXY: "http://127.0.0.1:9"
+          HTTPS_PROXY: "http://127.0.0.1:9"
+          ALL_PROXY: "http://127.0.0.1:9"
+          NO_PROXY: ""
+        run: |
+          export http_proxy="$HTTP_PROXY" https_proxy="$HTTPS_PROXY"
+          export all_proxy="$ALL_PROXY" no_proxy="$NO_PROXY"
+          PYTHONDONTWRITEBYTECODE=1 python -m unittest discover -s .agents/skills/nanodot-review/tests -v
