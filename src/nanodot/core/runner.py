@@ -31,6 +31,7 @@ MAX_BACKOFF_SECONDS = 3600
 PROLONGED_FAILURE_SECONDS = 3600
 SUMMARY_BUDGET_SECONDS = 1.0
 CHECK_OBSERVED = "check-observed"  # per-poll record of what the runner saw
+OBSERVATION_RETENTION = 20  # recent per-poll digests kept per task
 
 
 def state_change_from_event(event: WatchEvent) -> StateChange:
@@ -226,6 +227,17 @@ class TaskLoop:
                 task_id, kind,
             )
 
+    def _record_event(self, event: WatchEvent) -> None:
+        """Record an event with its replay identity: the occurrence the
+        notification sink already deduplicates on, so a crash-and-replay
+        duplicate is detectable from the log alone."""
+        evidence = dict(event.evidence or {})
+        if event.occurrence is not None:
+            evidence.setdefault("occurrence", event.occurrence)
+        self._record(
+            event.task_id, event.kind, event.message, evidence, event.at
+        )
+
     def _run_locked(self, task: Task, now: float) -> RunOutcome:
         try:
             snapshot = self._fetcher.fetch(task.target)
@@ -256,20 +268,16 @@ class TaskLoop:
         watch_state, events = statemachine.step(task, snapshot, now)
         task.watch_state = watch_state
 
-        for index, event in enumerate(events):
-            if event.notable and self._provider is not None:
-                summary = self._summaries.summarize(self._provider, event)
-                if summary:
-                    events[index] = replace(event, summary=summary)
-
-        # A pause/cancel/scope edit during fetching or summarizing takes
-        # effect before anything is recorded or delivered: a superseded run
-        # leaves no activity entries at all.
+        # A pause/cancel/scope edit during fetching takes effect before
+        # anything is recorded or delivered: a superseded run leaves no
+        # activity entries and sends nothing to a provider.
         if skipped := self._superseded(task):
             return skipped
 
         # Observe → decide → act: every poll records what it saw before the
-        # events it produced, so the log alone replays every decision.
+        # events it produced, so the log alone replays every decision. The
+        # digest is high-volume by design; retention bounds it to the most
+        # recent OBSERVATION_RETENTION rows per task.
         self._record(
             task.id,
             CHECK_OBSERVED,
@@ -277,12 +285,22 @@ class TaskLoop:
             statemachine.observation(snapshot),
             now,
         )
+        self._prune_observations(task.id)
 
         for event in events:
-            self._record(
-                task.id, event.kind, event.message, event.evidence, event.at
-            )
+            # Record before any optional egress: nothing may reach a provider
+            # that the activity log cannot already reconstruct (adapter-seam
+            # discipline 3), and delivery can still be suppressed for a run
+            # superseded while the summary was in flight.
+            self._record_event(event)
             if event.notable:
+                summary = None
+                if self._provider is not None:
+                    summary = self._summaries.summarize(self._provider, event)
+                    if skipped := self._superseded(task):
+                        return skipped
+                if summary:
+                    event = replace(event, summary=summary)
                 self._sink.notify(event)
 
         terminal = any(event.terminal for event in events)
@@ -319,6 +337,15 @@ class TaskLoop:
         self._store.update(task)
         return RunOutcome.OK
 
+    def _prune_observations(self, task_id: str) -> None:
+        """Retention is best-effort: a failing prune must not fail the run."""
+        try:
+            self._activity.prune_observations(task_id, OBSERVATION_RETENTION, kind=CHECK_OBSERVED)
+        except Exception:
+            logging.getLogger(__name__).warning(
+                "task %s: observation history could not be pruned", task_id
+            )
+
     def _block(self, task: Task, error: Exception, now: float) -> None:
         reason = f"blocked: {error}"
         sequence = int(task.watch_state.get("event_sequence", 0)) + 1
@@ -331,9 +358,9 @@ class TaskLoop:
             at=now,
             occurrence=str(sequence),
         )
-        self._activity.append(
-            task_id=task.id, kind=event.kind, message=reason, at=now
-        )
+        # The log is isolation-guarded like every other write: a failing
+        # append must still notify the user and persist the BLOCKED state.
+        self._record_event(event)
         self._sink.notify(event)
         task.watch_state = dict(task.watch_state, event_sequence=sequence)
         task.state = TaskState.BLOCKED
@@ -352,10 +379,13 @@ class TaskLoop:
         task.next_check_at = now + backoff_seconds(task.cadence_seconds, failures)
         self._store.update(task)
 
-        self._activity.append(
+        # Isolation-guarded like every activity write: the retry is already
+        # durably scheduled, a failing append must not double-count it.
+        self._record(
             task_id=task.id,
             kind="fetch-retry",
             message=f"retryable fetch failure ({failures}): {error}",
+            evidence=None,
             at=now,
         )
 

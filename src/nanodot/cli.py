@@ -131,12 +131,26 @@ def _wiring(teardown: Teardown | None = None) -> tuple:
 
     auth_mode = str(Config().get("github-auth-mode", "token"))
     os_notify = _os_notifications_enabled()
+
+    def own(name: str, disposer) -> None:
+        # Registration is an effect of creating the resource, not a final
+        # step: a wiring failure partway through still unwinds everything
+        # opened before it. Creation order here, reverse unwind in
+        # Teardown.run — the loop drains before its stores close.
+        if teardown is not None:
+            teardown.register(name, disposer)
+
     secrets = FileSecretStore()
     redactor = Redactor(secrets)
     store = TaskStore(redactor=redactor)
+    own("task-store", store.close)
     activity = ActivityLog(redactor=redactor)
+    own("activity-log", activity.close)
     memory = MemoryStore(redactor=redactor, activity=activity)
+    own("memory-store", memory.close)
     sink = NativeNotifier(redactor=redactor, os_notify=os_notify)
+    if hasattr(sink, "close"):
+        own("inbox-sink", sink.close)
     fetcher = (
         GitHubSnapshotFetcher(auth_mode=auth_mode)
         if auth_mode == "anonymous" else GitHubSnapshotFetcher()
@@ -145,13 +159,7 @@ def _wiring(teardown: Teardown | None = None) -> tuple:
         store, fetcher, sink, activity,
         provider=configured_provider(), memory=memory,
     )
-    if teardown is not None:
-        # Registrations are effects: creation order here, reverse unwind in
-        # Teardown.run — the loop drains before its stores close.
-        teardown.register("task-store", store.close)
-        teardown.register("activity-log", activity.close)
-        teardown.register("memory-store", memory.close)
-        teardown.register("task-loop", loop.close)
+    own("task-loop", loop.close)
     return secrets, store, activity, sink, fetcher, loop
 
 
@@ -570,37 +578,44 @@ def _run_runner(args: argparse.Namespace) -> int:
         _, store, _, _, _, loop = _wiring(teardown)
         daemon = RunnerDaemon(loop, store)
 
+    def unwind() -> None:
+        # Reverse registration order; the next runner never meets a
+        # half-closed store, and a failing step never blocks the rest.
+        for name in teardown.run():
+            print(f"warning: {name} did not shut down cleanly", file=sys.stderr)
+
     try:
-        with RunnerLease(_pidfile(), stop, prepare=prepare):
-            try:
-                assert store is not None and daemon is not None
-                if args.once:
-                    attempted = daemon.tick(stop=stop)
-                    blockers = [t for t in store.list() if t.blocker]
-                    if blockers:
-                        for task in blockers:
-                            print(f"blocked: {task.id} ({task.target}): {task.blocker}",
-                                  file=sys.stderr)
-                        return 1
-                    print(f"ran {attempted} task(s)")
+        try:
+            with RunnerLease(_pidfile(), stop, prepare=prepare):
+                try:
+                    assert store is not None and daemon is not None
+                    if args.once:
+                        attempted = daemon.tick(stop=stop)
+                        blockers = [t for t in store.list() if t.blocker]
+                        if blockers:
+                            for task in blockers:
+                                print(f"blocked: {task.id} ({task.target}): {task.blocker}",
+                                      file=sys.stderr)
+                            return 1
+                        print(f"ran {attempted} task(s)")
+                        return 0
+                    signal.signal(signal.SIGINT, _sigint)
+                    signal.signal(signal.SIGTERM, _sigint)
+                    print("nanodot runner started — Ctrl-C to stop", flush=True)
+                    daemon.serve(stop)
+                    print("nanodot runner stopped")
                     return 0
-                signal.signal(signal.SIGINT, _sigint)
-                signal.signal(signal.SIGTERM, _sigint)
-                print("nanodot runner started — Ctrl-C to stop", flush=True)
-                daemon.serve(stop)
-                print("nanodot runner stopped")
-                return 0
-            finally:
-                # Unwind while still owning the lifetime lock, in reverse
-                # registration order: the next runner never meets a
-                # half-closed store, and a failing step never blocks the
-                # rest of the shutdown.
-                for name in teardown.run():
-                    print(f"warning: {name} did not shut down cleanly",
-                          file=sys.stderr)
-    except (RunnerControlError, OSError, ValueError) as error:
-        print(f"error: {error}", file=sys.stderr)
-        return 1
+                finally:
+                    # Unwind while still owning the lifetime lock.
+                    unwind()
+        except (RunnerControlError, OSError, ValueError) as error:
+            print(f"error: {error}", file=sys.stderr)
+            return 1
+    finally:
+        # Lease entry itself can fail after prepare() already registered
+        # disposers (a wiring failure, or publishing the readiness record).
+        # Teardown.run is idempotent: a completed unwind runs nothing here.
+        unwind()
 
 
 def _run_start(_: argparse.Namespace) -> int:

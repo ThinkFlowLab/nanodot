@@ -11,8 +11,12 @@ const MANIFEST = require('./uv-manifest.json');
 const SOURCE = path.resolve(__dirname, '..', 'src');
 const PYTHON_PROBE = 'import sys\nif sys.version_info < (3, 11): raise SystemExit(1)\nprint(sys.executable)';
 
+// Probe and execute must see the same caller environment: an interpreter
+// accepted in isolated mode (-I ignores PYTHONHOME/PYTHONPATH) but broken
+// by a stray PYTHONHOME would pass probing and then die with a raw fatal
+// error on every real command.
 function probePython(command) {
-  const result = spawnSync(command, ['-I', '-c', PYTHON_PROBE], {
+  const result = spawnSync(command, ['-c', PYTHON_PROBE], {
     encoding: 'utf8', timeout: 5000, stdio: ['ignore', 'pipe', 'ignore'],
   });
   return result.status === 0 ? result.stdout.trim() : null;
@@ -21,12 +25,16 @@ function probePython(command) {
 function run(command, args, env = process.env, check = true) {
   return new Promise((resolve, reject) => {
     const child = spawn(command, args, { env, stdio: ['inherit', check ? 2 : 'inherit', 'inherit'] });
-    const interrupt = () => child.kill('SIGINT');
+    // A terminal delivers SIGINT to the whole foreground process group, so
+    // the child already received it; re-sending would land a second
+    // KeyboardInterrupt inside the child's graceful teardown. Swallow it
+    // here only to stay alive and propagate the child's own exit status.
+    const ignoreInterrupt = () => {};
     const terminate = () => child.kill('SIGTERM');
-    process.on('SIGINT', interrupt);
+    process.on('SIGINT', ignoreInterrupt);
     process.on('SIGTERM', terminate);
     const cleanup = () => {
-      process.removeListener('SIGINT', interrupt);
+      process.removeListener('SIGINT', ignoreInterrupt);
       process.removeListener('SIGTERM', terminate);
     };
     child.on('error', error => { cleanup(); reject(error); });

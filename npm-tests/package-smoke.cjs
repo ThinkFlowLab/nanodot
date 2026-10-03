@@ -28,8 +28,8 @@ try {
   assert(paths.includes('bin/uv-manifest.json'));
   assert(paths.includes('src/nanodot/cli.py'));
   assert(paths.every(file =>
-    ['package.json', 'README.md', 'bin/nanodot.cjs', 'bin/uv-manifest.json'].includes(file)
-    || (file.startsWith('src/nanodot/') && file.endsWith('.py'))), paths);
+    ['package.json', 'README.md', 'LICENSE', 'bin/nanodot.cjs', 'bin/uv-manifest.json'].includes(file)
+    || file.startsWith('src/nanodot/') && file.endsWith('.py')), paths);
   const archive = path.join(temporary, packed.filename);
   const prefix = path.join(temporary, 'global prefix');
   run(process.execPath, [npm, 'install', '--global', '--prefix', prefix, '--ignore-scripts',

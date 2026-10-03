@@ -45,6 +45,7 @@ CREATE TABLE IF NOT EXISTS activity (
   evidence TEXT NOT NULL DEFAULT '{}'
 );
 CREATE INDEX IF NOT EXISTS idx_activity_task ON activity(task_id, at);
+CREATE INDEX IF NOT EXISTS idx_activity_task_kind ON activity(task_id, kind, at);
 """
 
 
@@ -143,6 +144,22 @@ class ActivityLog:
             )
             for row in rows
         ]
+
+    def prune_observations(self, task_id: str, keep: int, kind: str = "check-observed") -> int:
+        """Bound the per-poll history: keep only the ``keep`` most recent
+        observation rows for one task. Decisions and delivery records are
+        never touched — only the high-volume per-poll digest."""
+        if keep < 0:
+            raise ValueError("keep must not be negative")
+        with self._lock:
+            deleted = self._conn.execute(
+                "DELETE FROM activity WHERE task_id = ? AND kind = ? AND id NOT IN ("
+                "  SELECT id FROM activity WHERE task_id = ? AND kind = ?"
+                "  ORDER BY at DESC, rowid DESC LIMIT ?)",
+                (task_id, kind, task_id, kind, keep),
+            ).rowcount
+            self._conn.commit()
+        return int(deleted)
 
     def close(self) -> None:
         self._conn.close()

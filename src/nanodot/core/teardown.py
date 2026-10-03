@@ -30,13 +30,19 @@ class Teardown:
         """Unwind in reverse registration order, exactly once.
 
         Returns the names of disposers that raised; every disposer runs
-        regardless. A second call unwinds nothing.
+        regardless — a KeyboardInterrupt landing mid-unwind costs the step
+        it interrupted, never the steps after it. A second call unwinds
+        nothing.
         """
         failed: list[str] = []
         while self._disposers:
             name, disposer = self._disposers.pop()
             try:
                 disposer()
-            except Exception:
+            except BaseException:
+                # BaseException: the unwind is the last line of defense for
+                # "every step runs" — a second Ctrl-C must not leave the
+                # remaining stores half-closed. Names only, never exception
+                # text, which can carry private data.
                 failed.append(name)
         return failed

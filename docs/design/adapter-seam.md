@@ -36,11 +36,13 @@ the machinery. These bind any future adapter (DSH, openJiuwen, or other):
    registration creates registers a disposer with a teardown registry;
    shutdown runs the disposers in reverse registration order. Unload leaves
    no residue — no stale lifetime locks, no orphaned notifications (#37).
-3. **Provider-visible implies logged.** Nothing reaches an inference
-   provider that cannot be reconstructed from the activity log. EgressGuard
-   makes this structural; the egress tripwire test makes it checked. A new
-   egress field must be whitelisted in docs/design/egress.md and pinned by
-   that test first.
+3. **Provider-visible implies logged.** Nothing system-derived reaches an
+   inference provider that cannot be reconstructed from the activity log.
+   EgressGuard makes this structural; the egress tripwire test makes it
+   checked. A new egress field must be whitelisted in docs/design/egress.md
+   and pinned by that test first. (The user's own `--intent` sentence is the
+   documented exception — it is user input, not system-derived evidence, and
+   never enters the activity log.)
 4. **Typed errors across the seam.** Port errors are typed values
    (`FetchError` variants). Core never matches on error prose, and adapter
    results are mapped into core types — no string passthrough.

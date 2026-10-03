@@ -34,9 +34,9 @@ npx nanodot --help
 The launcher uses an existing Python 3.11+ when available. Otherwise, its first
 run downloads a private Python runtime automatically. macOS (Intel and Apple
 Silicon) and common Linux distributions (x86_64 and aarch64) are supported.
-Automatic setup needs internet access and `curl`, which is included with macOS
-and common Linux distributions; on minimal container images, install `curl` or
-Python 3.11+ first. Later runs reuse the installed runtime.
+Automatic setup needs internet access and `curl` plus `tar`, which are included
+with macOS and common Linux distributions; on minimal container images, install
+them or Python 3.11+ first. Later runs reuse the installed runtime.
 
 Runtime downloads live in `~/Library/Caches/nanodot/npm` on macOS and
 `~/.cache/nanodot/npm` on Linux; `XDG_CACHE_HOME` overrides the cache location.
