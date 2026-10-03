@@ -142,7 +142,7 @@ def _wiring(teardown: Teardown | None = None) -> tuple:
     from nanodot.core.tasks import TaskStore
     from nanodot.core.write_flow import WriteFlow
     from nanodot.native.github_client import GitHubSnapshotFetcher
-    from nanodot.native.inference_api import configured_provider
+    from nanodot.native.providers import configured_provider
     from nanodot.native.notifier import NativeNotifier
     from nanodot.native.secrets_file import FileSecretStore
 
@@ -254,6 +254,15 @@ def _run_config_values(args: argparse.Namespace) -> int:
         if value is None or (is_secret_name(args.name) and not value):
             print("error: a nonempty value is required", file=sys.stderr)
             return 1
+        if args.name == "model-provider":
+            from nanodot.native.providers import provider_names
+
+            if value not in provider_names():
+                print(
+                    f"error: model-provider must be one of: "
+                    f"{', '.join(provider_names())}", file=sys.stderr,
+                )
+                return 1
         if args.name == "github-write-token":
             # Set-time validation, fail closed: nothing is stored unless the
             # credential is separate from the read token and GitHub accepts
@@ -363,14 +372,27 @@ def _run_watch(args: argparse.Namespace) -> int:
         target_text = args.target or ""
         purpose = args.purpose
         if args.intent:
-            from nanodot.native.inference_api import configured_provider
+            from nanodot.core.config import Config as _Config
+            from nanodot.native.providers import configured_provider
             from nanodot.ports.inference import ProviderError
 
             provider = configured_provider()
             if provider is None:
-                print("note: no model configured (api-key, model-base-url, "
-                      "model-name); ignoring --intent", file=sys.stderr)
+                print("note: no model configured (model-provider, api-key, "
+                      "model); ignoring --intent", file=sys.stderr)
             else:
+                # The fact of this egress is recorded before the call; the
+                # user's own sentence never enters the log (egress.md
+                # carve-out — user input, not system-derived evidence).
+                activity.append(
+                    task_id="intent",
+                    kind="provider-call",
+                    message=(
+                        "parse_intent via "
+                        f"{_Config().get('model-provider', 'openai-compat')}"
+                    ),
+                    evidence={"call": "parse_intent"},
+                )
                 try:
                     draft = provider.parse_intent(args.intent)
                     target_text = target_text or draft.target

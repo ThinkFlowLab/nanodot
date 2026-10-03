@@ -41,7 +41,13 @@ def test_no_write_http_verbs_outside_the_write_port() -> None:
     native adapter (github_writer.py) plus the inference adapter — the two
     declared egress sites. Everything else, including github_client.py,
     issues GETs only (docs/design/github-writer.md, decision A1)."""
-    allowed = {"inference_api.py", "github_writer.py"}
+    allowed = {
+        "inference_api.py",  # compat shim; the POST moved to providers/
+        "github_writer.py",
+        "openai_compat.py",
+        "anthropic.py",
+    }
+    assert (SRC / "native" / "providers" / "openai_compat.py").exists()
     for py in SRC.rglob("*.py"):
         tree = ast.parse(py.read_text())
         for node in ast.walk(tree):

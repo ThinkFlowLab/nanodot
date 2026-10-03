@@ -238,8 +238,18 @@ provider:
 
 ```sh
 nanodot config set api-key
-nanodot config set model-base-url https://YOUR_PROVIDER/v1
+nanodot config set model-provider openai-compat   # or anthropic, glm, deepseek
 nanodot config set model-name YOUR_MODEL
+
+# Or per-provider namespaced settings (legacy flat keys keep working):
+
+nanodot config set model-provider glm
+nanodot config set api-key:glm            # hidden prompt
+nanodot config set provider.glm.model glm-4.7
+
+# The registry presets the base URL per provider (api.openai.com,
+# api.anthropic.com, open.bigmodel.cn, api.deepseek.com); override with
+# provider.<name>.base-url — https only, pinned at startup.
 nanodot watch add --intent 'watch owner/repo#123 until required checks pass'
 ```
 

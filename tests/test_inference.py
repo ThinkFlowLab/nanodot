@@ -137,7 +137,7 @@ def test_api_adapter_summarize_and_parse(monkeypatch) -> None:
             return _chat_response("model summary")
 
     monkeypatch.setattr(
-        "nanodot.native.inference_api.authenticated_urlopen", fake_urlopen
+        "nanodot.native.providers.openai_compat.authenticated_urlopen", fake_urlopen
     )
     provider = APIInferenceProvider(api_key=API_KEY, base_url="https://model.test/v1",
                                     model="m1")
@@ -165,7 +165,7 @@ def test_api_adapter_errors_are_provider_errors(monkeypatch) -> None:
         raise OSError("no network")
 
     monkeypatch.setattr(
-        "nanodot.native.inference_api.authenticated_urlopen", fake_urlopen
+        "nanodot.native.providers.openai_compat.authenticated_urlopen", fake_urlopen
     )
     provider = APIInferenceProvider(api_key=API_KEY)
     with pytest.raises(ProviderError):
@@ -176,7 +176,7 @@ def test_api_adapter_errors_are_provider_errors(monkeypatch) -> None:
         return _Response(b"not json at all")
 
     monkeypatch.setattr(
-        "nanodot.native.inference_api.authenticated_urlopen", bad_json
+        "nanodot.native.providers.openai_compat.authenticated_urlopen", bad_json
     )
     with pytest.raises(ProviderError):
         malformed.parse_intent("watch something")
@@ -267,7 +267,7 @@ def test_cli_intent_with_model_parses(home: Path, capsys, monkeypatch) -> None:
     # The CLI imports configured_provider at call time, so patching the
     # module attribute takes effect.
     monkeypatch.setattr(
-        "nanodot.native.inference_api.configured_provider", lambda: fake
+        "nanodot.native.providers.configured_provider", lambda: fake
     )
 
     code = main(["watch", "add", "--intent", "watch owner/repo#9", "--yes"])
@@ -330,7 +330,7 @@ def test_cli_runner_wiring_uses_configured_provider(home, monkeypatch):
     github.set_pr("open", head_sha="s1")
     github.add_check("ci", FAILURE, sha="s1")
     sink = FakeSink()
-    monkeypatch.setattr("nanodot.native.inference_api.configured_provider", lambda: provider)
+    monkeypatch.setattr("nanodot.native.providers.configured_provider", lambda: provider)
     monkeypatch.setattr("nanodot.native.github_client.GitHubSnapshotFetcher", lambda: github)
     monkeypatch.setattr("nanodot.native.notifier.NativeNotifier", lambda **kwargs: sink)
     # Provider wiring only: keep the write flow (auto default) out of the sink.
@@ -360,7 +360,7 @@ def test_truncated_response_body_is_a_provider_error(monkeypatch) -> None:
             raise http.client.IncompleteRead(b"{partial")
 
     monkeypatch.setattr(
-        "nanodot.native.inference_api.authenticated_urlopen",
+        "nanodot.native.providers.openai_compat.authenticated_urlopen",
         lambda request, timeout=None: _Truncated(b""),
     )
     provider = APIInferenceProvider(api_key=API_KEY)
