@@ -174,10 +174,13 @@ test('existing Python preserves literal arguments, data home, cwd and CLI exit s
   assert.equal(result.stderr, '');
   const call = JSON.parse(fs.readFileSync(path.join(f.root, 'app.jsonl')));
   assert.deepEqual(call.args.slice(3), args);
-  assert.equal(call.args[2], f.source);
+  // The launcher resolves its own module path, so /var → /private/var on
+  // macOS arrives resolved; compare against the real path everywhere.
+  const source = fs.realpathSync(f.source);
+  assert.equal(call.args[2], source);
   assert.equal(call.cwd, fs.realpathSync(path.join(f.root, 'caller')));
   assert.equal(call.dataHome, f.env.NANODOT_HOME);
-  assert.equal(call.pythonpath, f.source + path.delimiter + 'original-pythonpath');
+  assert.equal(call.pythonpath, source + path.delimiter + 'original-pythonpath');
   assert.equal(f.count('downloads'), 0);
 });
 
