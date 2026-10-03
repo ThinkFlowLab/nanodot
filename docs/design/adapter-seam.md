@@ -45,6 +45,22 @@ the machinery. These bind any future adapter (DSH, openJiuwen, or other):
    (`FetchError` variants). Core never matches on error prose, and adapter
    results are mapped into core types — no string passthrough.
 
+## Ownership boundary (decided 2026-10-03)
+
+One user, one data home, one writer. The lifetime flock, the single
+SQLite writer, and the local inbox all assume a single device;
+multi-device support (a phone reading the inbox, a second machine running
+the runner) is out of scope until demonstrated need. If it ever arrives,
+it comes as read-only mirroring or notification forwarding — or an
+explicit sync layer designed for it — never a second writer on one data
+home.
+
+Corollary for adapters: a future remote executor under rule 3 reports
+outcomes back to this data home. How truth is owned while the host sleeps
+(remote-hosted core with synchronized state vs. queued outcomes replayed
+on wake) is **explicitly deferred until the trigger fires** — do not
+implement half of it before then.
+
 ## Ports
 
 All ports live in `nanodot/ports` as small Protocols. Core depends on the
