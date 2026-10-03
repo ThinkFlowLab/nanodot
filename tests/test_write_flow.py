@@ -34,6 +34,7 @@ from nanodot.core.write_flow import (
     WRITE_FAILED,
     WRITE_INTENT,
     WRITE_PROPOSED,
+    WRITE_SILENCE_DENIED,
     WRITE_SKIPPED,
     WRITE_UNKNOWN,
     WriteFlow,
@@ -261,6 +262,50 @@ def test_expired_request_grants_nothing_and_re_request_works(home: Path) -> None
     h.tick()
     capability = h.approve_proposal()
     assert capability.content_hash
+
+
+def test_write_requests_use_the_four_hour_ttl(home: Path) -> None:
+    h = Harness(home)
+    h.tick()
+    request = h.permissions.pending()[0]
+    assert request.expires_at - request.created_at == 4 * 3600  # #48 decision 6
+
+
+def test_expired_ask_is_reasked_once_then_denied_by_silence(home: Path) -> None:
+    from nanodot.core.statemachine import CHECKS_FAILED, WatchEvent
+
+    h = Harness(home)
+    h.tick()  # first ask
+    assert len(h.permissions.pending()) == 1
+    event = WatchEvent(
+        kind=CHECKS_FAILED, message="checks failed",
+        evidence={"head_sha": "s1", "checks": [{"name": "ci", "conclusion": "failure"}]},
+        task_id=h.task.id, at=h.clock.time(),
+    )
+
+    h.clock.advance(4 * 3600 + 1)
+    h.permissions.sweep_expired()
+    assert h.permissions.pending() == []
+
+    # The same content is re-asked exactly once (#48 decision 3).
+    assert h.write.propose_write(h.task, event) is not None
+    assert len(h.permissions.pending()) == 1
+    history = h.permissions.request_history()
+    assert [r.state for r in history] == ["pending", "expired"]
+
+    # Second silence: a terminal denial, never re-asked.
+    h.clock.advance(4 * 3600 + 1)
+    h.permissions.sweep_expired()
+    denied = h.write.propose_write(h.task, event)
+    assert denied is not None and denied.kind == WRITE_SILENCE_DENIED
+    states = [s for s, _ in h.permissions.verbatim_request_states(h.task.id, denied.evidence["content_hash"])]
+    assert states[0] == "denied" and states.count("denied") == 1
+    assert h.permissions.pending() == []
+    assert h.writer.sends == []
+
+    # A third identical ask produces nothing, ever.
+    assert h.write.propose_write(h.task, event) is None
+    assert h.kinds().count(WRITE_SILENCE_DENIED) == 1
 
 
 # -- 5. single use ----------------------------------------------------------------

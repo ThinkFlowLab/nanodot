@@ -256,12 +256,22 @@ before enabling it. To disable inference, run `nanodot config unset api-key`.
 
 ```sh
 nanodot approvals
+nanodot approvals grant --action comment --target owner/repo#N
+nanodot approvals approve <request-id>
+nanodot approvals deny <request-id>
 ```
 
-This shows the current mode, pending requests, and active grants. The MVP only
-supports `readonly`: it can read GitHub metadata but cannot post comments,
-merge PRs, or perform other external writes. `gated` and `auto` modes cannot
-be enabled.
+`nanodot approvals` shows the current mode, pending requests, and active
+grants. The default `auto` mode never asks: a comment on a failing watched
+PR is sent only when a standing pre-grant exists (created by
+`approvals grant`, 7-day default expiry, `--no-expiry` to opt out);
+otherwise the write is skipped and recorded once in the inbox. `gated`
+mode (`nanodot config set permission-mode gated`) pauses every write as a
+proposal until you approve it; an unanswered proposal expires after 4
+hours, is re-asked at most once, and a second silence is recorded as a
+denial. `readonly` (`nanodot config set permission-mode readonly`)
+proposes and sends nothing. All writes additionally require
+`nanodot config set github-write-token`.
 
 ## Troubleshooting usage
 

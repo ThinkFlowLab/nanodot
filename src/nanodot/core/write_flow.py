@@ -12,7 +12,11 @@ import logging
 from typing import Callable
 
 from nanodot.core.activity import ActivityLog
-from nanodot.core.permissions import Mode, PermissionCenter
+from nanodot.core.permissions import (
+    WRITE_REQUEST_TTL_SECONDS,
+    Mode,
+    PermissionCenter,
+)
 from nanodot.core.redaction import Redactor
 from nanodot.core.statemachine import CHECKS_FAILED, WatchEvent
 from nanodot.core.tasks import Task
@@ -32,6 +36,7 @@ WRITE_PROPOSED = "write-proposed"
 WRITE_APPROVED = "write-approved"  # appended by the CLI, not the runner
 WRITE_AUTO = "write-auto"  # auto mode: a standing grant authorized this payload
 WRITE_SKIPPED = "write-skipped"  # auto mode: no standing grant; nothing sent or asked
+WRITE_SILENCE_DENIED = "write-silence-denied"  # two expired asks; terminal (#48 decision 3)
 WRITE_INTENT = "write-intent"
 WRITE_DONE = "write-done"
 WRITE_FAILED = "write-failed"
@@ -101,15 +106,40 @@ class WriteFlow:
         digest = payload_digest(payload)
         scope_hint = f"{WATCH_SCOPE}:{event.evidence.get('head_sha', '')[:10]}"
         if mode is Mode.GATED:
-            prior = self._permissions.has_verbatim_request(task.id, digest)
-            if prior in ("pending", "denied"):
+            states = self._permissions.verbatim_request_states(task.id, digest)
+            state_names = [state for state, _ in states]
+            if "pending" in state_names or "denied" in state_names:
                 return None  # never duplicate a pending ask, never re-ask a denial
+            expired = state_names.count("expired")
+            if expired >= 2:
+                # The second silence is an answer (#48 decision 3): the
+                # latest expired ask becomes a terminal denial.
+                self._permissions.mark_silence_denied(states[0][1])
+                denied = WatchEvent(
+                    kind=WRITE_SILENCE_DENIED,
+                    message=(
+                        f"comment on {task.target} asked twice with no answer "
+                        "— recorded as denied by silence and never re-asked"
+                    ),
+                    evidence={
+                        "action": COMMENT_ACTION,
+                        "target": str(task.target),
+                        "content_hash": digest,
+                    },
+                    notable=True,
+                    task_id=task.id,
+                    at=event.at,
+                    occurrence=digest,
+                )
+                self._append(denied)
+                return denied
             request = self._permissions.request(
                 action=COMMENT_ACTION,
                 target=str(task.target),
                 scope=scope_hint,
                 task_id=task.id,
                 content=payload,
+                ttl=WRITE_REQUEST_TTL_SECONDS,
             )
             proposed = WatchEvent(
                 kind=WRITE_PROPOSED,

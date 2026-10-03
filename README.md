@@ -137,11 +137,14 @@ boundary must hash-match what was authorized, and a crash mid-write
 surfaces as unknown in the inbox and is never blindly re-sent.
 
 `auto` (the default) never prompts: writes execute only against a
-standing pre-grant you create explicitly; grant-less content is skipped
-and recorded once, nothing sent, nothing asked. `gated` pauses every
-write as a proposal in the inbox until you run `nanodot approvals
-approve <request-id>`. `readonly` is the explicit hard-off — no writes
-are even proposed. All write modes require a separate write token
+standing pre-grant you create explicitly (`nanodot approvals grant
+--action comment --target owner/repo#N`, 7-day default expiry);
+grant-less content is skipped and recorded once, nothing sent, nothing
+asked. `gated` pauses every write as a proposal in the inbox until you
+run `nanodot approvals approve <request-id>`; a proposal nobody answers
+expires in 4 hours, is re-asked at most once, and a second silence is
+recorded as a denial — never re-asked verbatim. `readonly` is the
+explicit hard-off — no writes are even proposed. All write modes require a separate write token
 (`nanodot config set github-write-token`); the read token never gains
 write reach, and without a write token every mode is inert.
 
