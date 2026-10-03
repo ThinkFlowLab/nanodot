@@ -34,6 +34,11 @@ SUMMARY_BUDGET_SECONDS = 1.0
 CHECK_OBSERVED = "check-observed"  # per-poll record of what the runner saw
 DIGEST = "digest"  # scheduled status heartbeat (issue #80)
 STALE = "stale"  # once-per-commit idle alert (issue #84)
+FLAKY = "flaky"  # same-SHA conclusion flip (issue #86)
+
+# A flip needs both sides: red and green definitive conclusions.
+FLAKY_RED = frozenset({"failure", "error", "timed_out"})
+FLAKY_GREEN = frozenset({"success"})
 OBSERVATION_RETENTION = 20  # recent per-poll digests kept per task
 
 
@@ -337,6 +342,9 @@ class TaskLoop:
         if task.stale_after_seconds is not None:
             if self._superseded(task) is None:
                 self._maybe_stale(task, snapshot, events, now)
+        if task.flaky_alerts:
+            if self._superseded(task) is None:
+                self._maybe_flaky(task, snapshot, events, now)
 
         terminal = any(event.terminal for event in events)
         if terminal:
@@ -450,6 +458,90 @@ class TaskLoop:
         )
         self._record_event(stale)
         self._sink.notify(stale)
+
+    def _maybe_flaky(self, task: Task, snapshot, events: list, now: float) -> None:
+        """Same-SHA conclusion flips: one notification per flip. A flip is
+        red⇄green on the same head SHA — intra-snapshot (reruns in one poll)
+        or across polls. Non-definitive states never count; a new SHA resets
+        the tracker. Deliberately fires on a completing poll too: a flaky
+        check is worth knowing even as the watch ends."""
+        state = task.watch_state
+        if state.get("flaky_sha") != snapshot.head_sha:
+            state = dict(
+                state, flaky_sha=snapshot.head_sha,
+                flaky_seen={}, flaky_seq={}, flaky_mixed={},
+            )
+            task.watch_state = state
+        seen = dict(state["flaky_seen"])
+        seq = dict(state["flaky_seq"])
+        mixed = dict(state["flaky_mixed"])
+
+        by_name: dict[str, list] = {}
+        for run in snapshot.checks_for(snapshot.head_sha):
+            by_name.setdefault(run.name, []).append(run)
+
+        for name, runs in by_name.items():
+            definitive = [
+                run for run in runs
+                if run.conclusion in FLAKY_RED or run.conclusion in FLAKY_GREEN
+            ]
+            if not definitive:
+                continue  # queued/in-progress/etc. never count
+            latest = definitive[-1].conclusion
+            conclusions = {run.conclusion for run in definitive}
+            if len(conclusions) > 1:
+                # Intra-snapshot: red and green reruns of one name on one
+                # SHA in a single poll — fires once; repeats stay quiet.
+                if mixed.get(name):
+                    seen[name] = latest
+                    continue
+                mixed[name] = True
+                self._emit_flaky(
+                    task, snapshot, name, seq, now,
+                    direction="mixed (red and green runs in one poll)",
+                    involved=sorted(conclusions),
+                )
+                seen[name] = latest
+                continue
+            conclusion = definitive[0].conclusion
+            prior = seen.get(name)
+            seen[name] = conclusion
+            if prior is not None and prior != conclusion:
+                mixed.pop(name, None)  # a transition re-arms mixed flips
+                self._emit_flaky(
+                    task, snapshot, name, seq, now,
+                    direction=f"{prior} -> {conclusion}",
+                    involved=[prior, conclusion],
+                )
+        task.watch_state = dict(
+            state, flaky_seen=seen, flaky_seq=seq, flaky_mixed=mixed,
+        )
+
+    def _emit_flaky(
+        self, task: Task, snapshot, name: str, seq: dict,
+        now: float, direction: str, involved: list[str],
+    ) -> None:
+        seq[name] = int(seq.get(name, 0)) + 1
+        flaky = WatchEvent(
+            kind=FLAKY,
+            message=(
+                f"flaky: {name} on {snapshot.head_sha[:10]} flipped "
+                f"({direction}) for {task.target}"
+            ),
+            evidence={
+                **statemachine.observation(snapshot),
+                "rule": "notify: flaky check",
+                "check": name,
+                "direction": direction,
+                "conclusions": involved,
+            },
+            notable=True,
+            task_id=task.id,
+            at=now,
+            occurrence=f"flaky-{snapshot.head_sha[:10]}-{name}-{seq[name]}",
+        )
+        self._record_event(flaky)
+        self._sink.notify(flaky)
 
     def _prune_observations(self, task_id: str) -> None:
         """Retention is best-effort: a failing prune must not fail the run."""

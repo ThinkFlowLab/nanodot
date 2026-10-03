@@ -370,6 +370,23 @@ def test_watch_add_stale_persists_and_shows(
     assert main(["watch", "show", task.id]) == 0
     assert "stale alert:" in capsys.readouterr().out
 
+
+def test_flaky_flag_persists_previews_and_shows(
+    home: Path, token: str, capsys: pytest.CaptureFixture[str]
+) -> None:
+    def fake_input(prompt: str = "") -> str:
+        return "y"
+
+    with mock.patch("builtins.input", side_effect=fake_input):
+        assert main(["watch", "add", TARGET, "--flaky", "--stale", "3d"]) == 0
+    out = capsys.readouterr().out
+    assert "flaky alerts:" in out and "stale alert:" in out
+    task = TaskStore().list()[0]
+    assert task.flaky_alerts is True
+
+    assert main(["watch", "show", task.id]) == 0
+    assert "flaky alerts:" in capsys.readouterr().out
+
     with mock.patch("builtins.input", side_effect=fake_input):
         with pytest.raises(SystemExit) as caught:
             main(["watch", "add", TARGET, "--stale", "5d"])

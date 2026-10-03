@@ -170,6 +170,16 @@ notification fires (days idle, PR state, head, checks). A new commit re-arms
 it; terminal, failing, paused, or cancelled ticks never alert. Composes
 freely with `--digest`.
 
+### Flaky-check alerts
+
+`watch add --flaky` alerts when a check's conclusion flips between red and
+green **on the same head SHA** — the nondeterministic-CI signal. A flip is
+detected from reruns inside a single poll or across polls; queued or
+in-progress states never count, and a new commit resets the tracker. One
+notification per flip (check name, head, direction), so flapping stays
+distinct while crash-replays dedup in the inbox. A flip on the poll that
+completes the watch still fires. Composes with `--digest` and `--stale`.
+
 ### Fixed watch policy
 
 This MVP supports a fixed, validated policy. It notifies on new commits, check
