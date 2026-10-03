@@ -12,7 +12,8 @@ from nanodot.core.config import Config
 from nanodot.core.memory import MemoryStore
 from nanodot.core.redaction import Redactor
 from nanodot.core.tasks import TaskStore
-from nanodot.native.inference_api import APIInferenceProvider, configured_provider
+from nanodot.native.providers import configured_provider
+from nanodot.native.providers.openai_compat import APIInferenceProvider
 from nanodot.native.secrets_file import FileSecretStore
 from nanodot.ports.inference import ProviderError, StateChange
 
@@ -41,7 +42,7 @@ def test_real_provider_factory_scrubs_every_outbound_value(home, monkeypatch):
         requests.append(request)
         return response(f"redact {SECRET}")
 
-    monkeypatch.setattr("nanodot.native.inference_api.authenticated_urlopen", urlopen)
+    monkeypatch.setattr("nanodot.native.providers.openai_compat.authenticated_urlopen", urlopen)
     assert provider.summarize(StateChange(
         kind=SECRET, summary=SECRET, head_sha=SECRET,
         pr_state=SECRET, url=f"https://example.test/{SECRET}",
@@ -61,7 +62,7 @@ def test_real_cli_intent_scrubs_input_output_and_retained_task(home, monkeypatch
         bodies.append(request.data.decode())
         return response(json.dumps({"target": "o/r#1", "purpose": f"watch {SECRET}"}))
 
-    monkeypatch.setattr("nanodot.native.inference_api.authenticated_urlopen", urlopen)
+    monkeypatch.setattr("nanodot.native.providers.openai_compat.authenticated_urlopen", urlopen)
     assert main(["watch", "add", "--intent", f"watch with {SECRET}", "--yes"]) == 0
     assert len(bodies) == 1
     assert SECRET not in bodies[0]
@@ -109,7 +110,7 @@ def test_provider_errors_do_not_echo_known_secrets(home, monkeypatch):
     def urlopen(request, **kwargs):
         raise urllib.error.HTTPError(request.full_url, 503, "bad", {}, io.BytesIO(SECRET.encode()))
 
-    monkeypatch.setattr("nanodot.native.inference_api.authenticated_urlopen", urlopen)
+    monkeypatch.setattr("nanodot.native.providers.openai_compat.authenticated_urlopen", urlopen)
     with pytest.raises(ProviderError) as error:
         provider.parse_intent("watch o/r#1")
     assert SECRET not in str(error.value)
@@ -118,7 +119,7 @@ def test_provider_errors_do_not_echo_known_secrets(home, monkeypatch):
 @pytest.mark.parametrize("fence", ["json", ""])
 def test_provider_accepts_fenced_json(home, monkeypatch, fence):
     provider = configured(home)
-    monkeypatch.setattr("nanodot.native.inference_api.authenticated_urlopen", lambda *a, **k: response(
+    monkeypatch.setattr("nanodot.native.providers.openai_compat.authenticated_urlopen", lambda *a, **k: response(
         f'```{fence}\n{{"target": "o/r#1", "purpose": "watch"}}\n```'
     ))
     assert provider.parse_intent("watch").target == "o/r#1"
@@ -127,7 +128,7 @@ def test_provider_accepts_fenced_json(home, monkeypatch, fence):
 @pytest.mark.parametrize("content", [None, {}, [], 7])
 def test_non_text_provider_content_is_typed_error(home, monkeypatch, content):
     provider = configured(home)
-    monkeypatch.setattr("nanodot.native.inference_api.authenticated_urlopen", lambda *a, **k: response(content))
+    monkeypatch.setattr("nanodot.native.providers.openai_compat.authenticated_urlopen", lambda *a, **k: response(content))
     with pytest.raises(ProviderError):
         provider.summarize(StateChange(kind="test", summary="test"))
 
@@ -140,7 +141,7 @@ def test_direct_provider_protects_own_key_and_bounds_http_timeout(home, monkeypa
         calls.append((request, kwargs))
         return response("summary")
 
-    monkeypatch.setattr("nanodot.native.inference_api.authenticated_urlopen", urlopen)
+    monkeypatch.setattr("nanodot.native.providers.openai_compat.authenticated_urlopen", urlopen)
     provider.summarize(StateChange(kind="test", summary=API_KEY))
     assert API_KEY not in calls[0][0].data.decode()
     assert calls[0][1]["timeout"] <= 5
@@ -202,7 +203,7 @@ def test_watch_listing_does_not_construct_fetcher_provider_notifier(home, monkey
     def forbidden(*a, **k):
         raise AssertionError("read-only list must not initialize adapters")
 
-    monkeypatch.setattr("nanodot.native.inference_api.configured_provider", forbidden)
+    monkeypatch.setattr("nanodot.native.providers.configured_provider", forbidden)
     monkeypatch.setattr("nanodot.native.notifier.NativeNotifier", forbidden)
     monkeypatch.setattr("nanodot.native.github_client.GitHubSnapshotFetcher", forbidden)
     assert main(["watch", "list"]) == 0
@@ -250,7 +251,7 @@ def test_direct_provider_escaped_key_scrubbed_before_serialization(home, monkeyp
         bodies.append(json.loads(request.data))
         return response("summary")
 
-    monkeypatch.setattr("nanodot.native.inference_api.authenticated_urlopen", urlopen)
+    monkeypatch.setattr("nanodot.native.providers.openai_compat.authenticated_urlopen", urlopen)
     provider.summarize(StateChange(kind="x", summary=key, checks=((key, "failure"),)))
     payload = json.loads(bodies[0]["messages"][1]["content"])
     assert payload["summary"] == "***"
@@ -260,7 +261,7 @@ def test_direct_provider_escaped_key_scrubbed_before_serialization(home, monkeyp
 def test_direct_provider_intent_fields_and_raw_scrub_decoded_key(home, monkeypatch):
     key = 'key"with\\quotes'
     provider = APIInferenceProvider(api_key=key)
-    monkeypatch.setattr("nanodot.native.inference_api.authenticated_urlopen", lambda *a, **k: response(
+    monkeypatch.setattr("nanodot.native.providers.openai_compat.authenticated_urlopen", lambda *a, **k: response(
         json.dumps({"target": "o/r#1", "purpose": key, "ignored": key})
     ))
     draft = provider.parse_intent("watch")

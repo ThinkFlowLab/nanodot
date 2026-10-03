@@ -181,7 +181,7 @@ def test_wiring_failure_still_unwinds_registered_resources(
     # _wiring imports configured_provider locally at call time; patch the
     # source module so the failure lands mid-wiring, after the stores open.
     monkeypatch.setattr(
-        "nanodot.native.inference_api.configured_provider", broken_provider
+        "nanodot.native.providers.configured_provider", broken_provider
     )
 
     assert main(["runner", "--once"]) == 1

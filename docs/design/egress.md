@@ -29,8 +29,20 @@ there is structurally no way to attach anything else:
   value, including check names and nested evidence. The production factory
   supplies the configured secret store to the redactor.
 
+**Destinations** are a registry, not a hard-wired URL (`native.providers`):
+`openai-compat` (the default — any OpenAI-compatible endpoint, including
+local runtimes by base-URL override), `anthropic` (Messages API), and the
+`glm` / `deepseek` presets of the OpenAI-compatible protocol. The payload
+whitelist above is identical for every destination; only the protocol
+envelope, credential header, and endpoint differ. Selection is
+`nanodot config set model-provider <name>`; the base URL is pinned and
+validated (https, no fragment) once at construction, and every provider
+egress — summarize or parse_intent — is recorded in the activity log
+before the call (`provider-call` entries: the provider and call type,
+never the user's own sentence).
+
 If the model is an API model, the above data leaves the host to that
-provider; the API key travels only in the `Authorization` header. A local
+provider; the API key travels only in the credential header. A local
 model behind the same interface removes this egress entirely — no other
 code changes.
 

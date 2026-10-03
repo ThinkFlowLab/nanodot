@@ -58,8 +58,10 @@ class Redactor:
 _SECRET_NAME_RE = re.compile(
     r"(?:^|[-_])(?:token|key|secret|password|passwd|pat)$", re.IGNORECASE
 )
+# Provider-namespaced API keys: api-key:openai-compat, api-key:glm, ...
+_PROVIDER_KEY_RE = re.compile(r"^api-key:[\w.-]+$", re.IGNORECASE)
 
 
 def is_secret_name(name: str) -> bool:
     """Config keys that name secrets and must route to the secret store."""
-    return bool(_SECRET_NAME_RE.search(name))
+    return bool(_SECRET_NAME_RE.search(name)) or bool(_PROVIDER_KEY_RE.match(name))
