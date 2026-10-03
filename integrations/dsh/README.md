@@ -60,6 +60,12 @@ through to the child).
   covered offline by `npm-tests/dsh-plugin.test.cjs` (`npm test`): exact
   argument mapping, injection-safe argument handling, parameter validation,
   timeout/abort, typed errors on nonzero exit.
+- `npm-tests/dsh-contract.test.cjs` drives the **real CLI** (repo source via
+  a python shim, dead proxies, isolated data home) through every tool's
+  offline lifecycle — add → show → activity → pause/resume/cancel → tick →
+  inbox → typed `NANODOT_EXIT_1` for `status` without a runner. If the CLI's
+  argument surface drifts from the tool table, this is what breaks. It needs
+  python ≥ 3.11 on PATH and skips loudly otherwise.
 - `index.ts` is the Cordis registration shim (~30 lines). It is written
   against the plugin API documented in the v0.1 developer-preview guide and
   has **not** been run against a live DSH yet — DSH expects breaking changes
