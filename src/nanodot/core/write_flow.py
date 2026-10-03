@@ -17,6 +17,7 @@ from nanodot.core.permissions import (
     Mode,
     PermissionCenter,
 )
+from nanodot.core.quota import WriteQuota
 from nanodot.core.redaction import Redactor
 from nanodot.core.statemachine import CHECKS_FAILED, WatchEvent
 from nanodot.core.tasks import Task
@@ -74,10 +75,12 @@ class WriteFlow:
         writer: GitHubWriter,
         activity: ActivityLog,
         redactor: Redactor | None = None,
+        quota: WriteQuota | None = None,
     ) -> None:
         self._permissions = permissions
         self._writer = writer
         self._activity = activity
+        self._quota = quota
         # The requests table is a persistence boundary: content is scrubbed
         # before it is hashed and stored, so what was approved, what is
         # logged, and what is sent are the same secret-free bytes.
@@ -101,6 +104,12 @@ class WriteFlow:
             self._permissions.assert_allowed(COMMENT_ACTION)
         except Exception:
             return None
+        # The budget gates proposal: no request is created for an action
+        # that may not be attempted again today (issue #53).
+        if self._quota is not None:
+            verdict = self._quota.check(COMMENT_ACTION, task.id, event.at)
+            if not verdict.allowed:
+                return None
         payload = draft_failure_comment(task, event)
         payload["body"] = self._redactor.scrub(payload["body"])
         digest = payload_digest(payload)
@@ -256,6 +265,18 @@ class WriteFlow:
                 continue  # no durable intent, no send — fail closed
             if superseded is not None and superseded():
                 return events  # consumed but unsent: recovery owns the doubt
+            if self._quota is not None:
+                # Budget consumed at issue, once per evidence digest; denial
+                # is an outcome (the capability is spent and recorded), the
+                # same degradation as a failed send — never an error path.
+                verdict = self._quota.consume(
+                    COMMENT_ACTION, task.id, capability.content_hash, now
+                )
+                if not verdict.allowed:
+                    events.append(
+                        self._finish(task, capability, "quota exhausted", now)
+                    )
+                    continue
             events.append(self._finish(task, capability, self._send(capability, payload), now))
         return events
 
