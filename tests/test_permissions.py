@@ -150,6 +150,42 @@ def test_auto_mode_is_the_default_and_settable(home: Path) -> None:
         center.assert_allowed("merge")  # unimplemented writes fail closed
 
 
+def test_approvals_grant_creates_a_standing_grant(
+    home: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    from nanodot.cli import main
+    from nanodot.core.tasks import PRTarget, Task, TaskStore
+
+    store = TaskStore()
+    task = store.create(
+        Task(target=PRTarget.parse("owner/repo#1"), purpose="watch", next_check_at=0.0)
+    )
+    store.close()
+
+    assert main([
+        "approvals", "grant", "--action", "comment", "--target", "owner/repo#1",
+    ]) == 0
+    out = capsys.readouterr().out
+    assert "standing grant" in out
+    assert "expires in 168h" in out
+
+    center = PermissionCenter()
+    grants = center.grants(active_only=True)
+    assert len(grants) == 1
+    assert grants[0].content_hash == ""  # standing: payload not bound
+    assert grants[0].task_id == task.id
+    assert grants[0].scope == "watch"
+    assert grants[0].expires_at - grants[0].created_at == pytest.approx(168 * 3600)
+
+    # The listing marks standing grants; unknown actions are rejected.
+    assert main(["approvals"]) == 0
+    assert "[standing]" in capsys.readouterr().out
+    assert main([
+        "approvals", "grant", "--action", "merge", "--target", "owner/repo#1",
+    ]) == 1
+    assert "must be one of" in capsys.readouterr().err
+
+
 # -- scoped grants -----------------------------------------------------------------
 
 

@@ -101,6 +101,15 @@ def build_parser() -> argparse.ArgumentParser:
     a_approve.add_argument("request_id")
     a_deny = approvals_sub.add_parser("deny", help="deny a pending request")
     a_deny.add_argument("request_id")
+    a_grant = approvals_sub.add_parser(
+        "grant", help="pre-grant a standing capability (auto mode)"
+    )
+    a_grant.add_argument("--action", required=True)
+    a_grant.add_argument("--target", required=True)
+    a_grant.add_argument("--scope", default="watch")
+    a_grant.add_argument("--task", help="task id (defaults to the one active watch)")
+    a_grant.add_argument("--expiry-hours", type=float, default=168.0)
+    a_grant.add_argument("--no-expiry", action="store_true")
 
     # -- activity / inbox --------------------------------------------------
     activity = subparsers.add_parser("activity", help="what actually ran")
@@ -577,6 +586,73 @@ def _run_approvals(args: argparse.Namespace) -> int:
         print(f"denied {args.request_id} (never re-asked verbatim)")
         return 0
 
+    if command == "grant":
+        from nanodot.core.tasks import TaskStore
+
+        from nanodot.core.permissions import WRITE_ACTIONS
+
+        if args.action not in WRITE_ACTIONS:
+            print(
+                f"error: action must be one of {sorted(WRITE_ACTIONS)}",
+                file=sys.stderr,
+            )
+            return 1
+        store = TaskStore()
+        try:
+            if args.task:
+                task_id = args.task
+                if store.get(task_id) is None:
+                    print(f"error: no such task {task_id}", file=sys.stderr)
+                    return 1
+            else:
+                active = [t for t in store.list() if t.state.value == "active"]
+                if len(active) != 1:
+                    print(
+                        "error: pass --task (or exactly one active watch is "
+                        "required to infer it)",
+                        file=sys.stderr,
+                    )
+                    return 1
+                task_id = active[0].id
+            expires_at = (
+                None
+                if args.no_expiry
+                else time.time() + args.expiry_hours * 3600
+            )
+            grant = center.create_standing_grant(
+                action=args.action,
+                target=args.target,
+                scope=args.scope,
+                task_id=task_id,
+                expires_at=expires_at,
+            )
+            activity = ActivityLog(redactor=Redactor(FileSecretStore()))
+            activity.append(
+                task_id=task_id,
+                kind="write-granted",
+                message=(
+                    f"standing grant for {grant.action} on {grant.target} "
+                    f"(scope {grant.scope})"
+                ),
+                evidence={"grant_id": grant.id, "standing": True},
+            )
+            horizon = (
+                "no expiry"
+                if expires_at is None
+                else f"expires in {args.expiry_hours:g}h"
+            )
+            print(
+                f"standing grant {grant.id} for {grant.action} on {grant.target} "
+                f"task={task_id} ({horizon}); auto mode will authorize exact "
+                "payloads under it without asking"
+            )
+        except ValueError as error:
+            print(f"error: {error}", file=sys.stderr)
+            return 1
+        finally:
+            store.close()
+        return 0
+
     try:
         mode = center.mode()
     except ValueError as error:
@@ -596,8 +672,10 @@ def _run_approvals(args: argparse.Namespace) -> int:
     grants = center.grants(active_only=True)
     print(f"active grants: {len(grants)}")
     for grant in grants:
+        standing = " [standing]" if grant.content_hash == "" else ""
         print(
             f"  {grant.id}  {grant.action} on {grant.target} ({grant.scope})"
+            f"{standing}"
         )
     return 0
 

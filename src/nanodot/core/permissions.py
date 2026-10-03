@@ -29,6 +29,10 @@ from nanodot.paths import database_path
 from nanodot.ports.github_writer import WriteCapability, payload_digest
 
 DEFAULT_REQUEST_TTL_SECONDS = 24 * 3600
+# Write requests: 4 hours (#48 decision 6) — a late-approved comment on a
+# fast-moving PR references a stale head SHA; the re-ask policy covers
+# overnight silences.
+WRITE_REQUEST_TTL_SECONDS = 4 * 3600
 
 
 class WriteForbidden(PermissionError):
@@ -420,13 +424,32 @@ class PermissionCenter:
         """The state of an earlier request for this exact content, if any —
         a denial is never re-asked verbatim, and a pending one is not
         duplicated."""
+        states = self.verbatim_request_states(task_id, content_hash)
+        return states[0][0] if states else None
+
+    def verbatim_request_states(
+        self, task_id: str, content_hash: str
+    ) -> list[tuple[str, str]]:
+        """Every (state, request_id) for this exact content, newest first —
+        the re-ask policy reads how many times silence has expired."""
         with self._lock:
-            row = self._conn.execute(
-                "SELECT state FROM requests WHERE task_id=? AND content_hash=? "
-                "ORDER BY created_at DESC LIMIT 1",
+            rows = self._conn.execute(
+                "SELECT state, id FROM requests WHERE task_id=? AND content_hash=? "
+                "ORDER BY created_at DESC",
                 (task_id, content_hash),
-            ).fetchone()
-        return row["state"] if row else None
+            ).fetchall()
+        return [(row["state"], row["id"]) for row in rows]
+
+    def mark_silence_denied(self, request_id: str) -> bool:
+        """The second silence is an answer: an expired request becomes a
+        terminal denial (#48 decision 3), never re-asked verbatim."""
+        with self._lock:
+            cursor = self._conn.execute(
+                "UPDATE requests SET state='denied' WHERE id=? AND state='expired'",
+                (request_id,),
+            )
+            self._conn.commit()
+            return cursor.rowcount == 1
 
     def deny(self, request_id: str) -> None:
         """A denial is an answer: recorded, never re-asked verbatim."""
