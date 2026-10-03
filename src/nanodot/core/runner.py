@@ -32,6 +32,7 @@ MAX_BACKOFF_SECONDS = 3600
 PROLONGED_FAILURE_SECONDS = 3600
 SUMMARY_BUDGET_SECONDS = 1.0
 CHECK_OBSERVED = "check-observed"  # per-poll record of what the runner saw
+DIGEST = "digest"  # scheduled status heartbeat (issue #80)
 OBSERVATION_RETENTION = 20  # recent per-poll digests kept per task
 
 
@@ -326,6 +327,13 @@ class TaskLoop:
                 if proposed is not None:
                     self._sink.notify(proposed)
 
+        # A scheduled digest fires only on a healthy, non-terminal poll of
+        # a digest-enabled watch, after the interval fully elapsed. It is
+        # the daily heartbeat: a quiet PR still reports once per window.
+        if task.digest_interval_seconds is not None:
+            if self._superseded(task) is None:
+                self._maybe_digest(task, snapshot, events, now)
+
         terminal = any(event.terminal for event in events)
         if terminal:
             terminal_event = next(e for e in events if e.terminal)
@@ -359,6 +367,41 @@ class TaskLoop:
         task.next_check_at = now + task.cadence_seconds
         self._store.update(task)
         return RunOutcome.OK
+
+    def _maybe_digest(self, task: Task, snapshot, events: list, now: float) -> None:
+        interval = task.digest_interval_seconds
+        assert interval is not None  # caller-checked
+        last = task.watch_state.get("last_digest_at")
+        if last is None:
+            # A full interval must elapse before the first digest.
+            task.watch_state = dict(task.watch_state, last_digest_at=now)
+            return
+        if now - float(last) < interval:
+            return
+        window = int(now // interval)  # one digest per window, crash-replay safe
+        task.watch_state = dict(task.watch_state, last_digest_at=now)
+        digest = WatchEvent(
+            kind=DIGEST,
+            message=(
+                f"digest: {task.target} is {snapshot.pr_state} on "
+                f"{snapshot.head_sha[:10]}; "
+                f"{len(snapshot.checks_for(snapshot.head_sha))} check(s) on head"
+            ),
+            evidence={
+                **statemachine.observation(snapshot),
+                "rule": "notify: scheduled digest",
+            },
+            notable=True,
+            task_id=task.id,
+            at=now,
+            occurrence=f"digest-{window}",
+        )
+        # Terminal events already notify this tick; the digest would only
+        # duplicate. Skip it when this poll is a terminal one.
+        if any(event.terminal for event in events):
+            return
+        self._record_event(digest)
+        self._sink.notify(digest)
 
     def _prune_observations(self, task_id: str) -> None:
         """Retention is best-effort: a failing prune must not fail the run."""

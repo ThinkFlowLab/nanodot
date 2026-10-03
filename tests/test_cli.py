@@ -326,3 +326,28 @@ def test_approvals_approve_and_denied_never_reasked(
     assert center.has_verbatim_request(
         "task-1", payload_digest({"body": "the exact approved text"})
     ) == "denied"
+
+
+def test_watch_add_digest_persists_and_shows(
+    home: Path, token: str, capsys: pytest.CaptureFixture[str]
+) -> None:
+    def fake_input(prompt: str = "") -> str:
+        return "y"
+
+    with mock.patch("builtins.input", side_effect=fake_input):
+        assert main(["watch", "add", TARGET, "--digest", "24h"]) == 0
+    out = capsys.readouterr().out
+    assert "digest:" in out  # preview line
+    task = TaskStore().list()[0]
+    assert task.digest_interval_seconds == 86400
+
+    assert main(["watch", "show", task.id]) == 0
+    assert "digest:" in capsys.readouterr().out
+
+    # Invalid values are rejected by the fixed-enum parser before anything
+    # is persisted (argparse exits 2).
+    with mock.patch("builtins.input", side_effect=fake_input):
+        with pytest.raises(SystemExit) as caught:
+            main(["watch", "add", TARGET, "--digest", "2d"])
+    assert caught.value.code == 2
+    assert len(TaskStore().list()) == 1
