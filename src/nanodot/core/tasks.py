@@ -22,7 +22,20 @@ from nanodot.core.permissions import invalidate_task_grants
 from nanodot.core.redaction import Redactor
 from nanodot.paths import database_path
 
+def _ensure_column(
+    connection: sqlite3.Connection, table: str, ddl: str
+) -> None:
+    """Additive, pragma-guarded migration: legacy rows read as NULL = off."""
+    columns = {row[1] for row in connection.execute(f"PRAGMA table_info({table})")}
+    if ddl.split(maxsplit=1)[0] not in columns:
+        connection.execute(f"ALTER TABLE {table} ADD COLUMN {ddl}")
+
+
 READ_ONLY_ACTIONS = frozenset({"read"})
+
+# The digest heartbeat's fixed policy surface (issue #80): no free-form
+# intervals — off (None) or exactly one of these windows.
+DIGEST_INTERVALS = frozenset({21600, 43200, 86400})  # 6h / 12h / 24h
 
 # The MVP implements one fixed watch policy, not a natural-language rule
 # interpreter. Keep the two previously shipped default spellings as explicit
@@ -99,6 +112,7 @@ class Task:
     created_at: float = field(default_factory=time.time)
     updated_at: float = field(default_factory=time.time)
     next_check_at: float | None = None
+    digest_interval_seconds: int | None = None  # scheduled digest; None = off
     watch_state: dict = field(default_factory=dict)
     id: str = field(default_factory=lambda: uuid.uuid4().hex[:12])
 
@@ -111,6 +125,14 @@ class Task:
         if extra:
             raise TaskError(
                 f"actions not allowed in the read-only MVP: {sorted(extra)}"
+            )
+        if (
+            self.digest_interval_seconds is not None
+            and self.digest_interval_seconds not in DIGEST_INTERVALS
+        ):
+            raise TaskError(
+                "digest interval must be one of: "
+                + ", ".join(f"{v // 3600}h" for v in sorted(DIGEST_INTERVALS))
             )
         if "read" not in self.allowed_actions:
             raise TaskError("a PR watch requires the read action")
@@ -141,6 +163,7 @@ CREATE TABLE IF NOT EXISTS tasks (
   created_at REAL NOT NULL,
   updated_at REAL NOT NULL,
   next_check_at REAL,
+  digest_interval_seconds INTEGER,
   watch_state TEXT NOT NULL DEFAULT '{}'
 );
 """
@@ -164,6 +187,7 @@ class TaskStore:
         self._conn.row_factory = sqlite3.Row
         with self._lock:
             self._conn.executescript(_SCHEMA)
+            _ensure_column(self._conn, "tasks", "digest_interval_seconds INTEGER")
             self._conn.commit()
 
     # -- mapping helpers -------------------------------------------------
@@ -189,6 +213,7 @@ class TaskStore:
             created_at=row["created_at"],
             updated_at=row["updated_at"],
             next_check_at=row["next_check_at"],
+            digest_interval_seconds=row["digest_interval_seconds"],
             watch_state=json.loads(row["watch_state"]),
         )
 
@@ -207,6 +232,7 @@ class TaskStore:
             task.created_at,
             task.updated_at,
             task.next_check_at,
+            task.digest_interval_seconds,
             json.dumps(task.watch_state),
         )
 
@@ -227,7 +253,7 @@ class TaskStore:
         try:
             with self._lock, self._conn:
                 self._conn.execute(
-                    "INSERT INTO tasks VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    "INSERT INTO tasks VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                     self._task_to_values(task),
                 )
         except sqlite3.IntegrityError as error:
@@ -295,7 +321,7 @@ class TaskStore:
                 "UPDATE tasks SET target=?, purpose=?, cadence_seconds=?, "
                 "allowed_actions=?, notification_conditions=?, stop_conditions=?, "
                 "state=?, blocker=?, scope_version=?, created_at=?, updated_at=?, "
-                "next_check_at=?, watch_state=? WHERE id=?",
+                "next_check_at=?, digest_interval_seconds=?, watch_state=? WHERE id=?",
                 self._task_to_values(task)[1:] + (task.id,),
             )
         return task

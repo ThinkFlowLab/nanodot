@@ -28,6 +28,7 @@ from nanodot.core.tasks import (
 )
 
 DEFAULT_CADENCE = 300
+DIGEST_CHOICES = {"off": None, "6h": 21600, "12h": 43200, "24h": 86400}
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -57,6 +58,8 @@ def build_parser() -> argparse.ArgumentParser:
     add = watch_sub.add_parser("add", help="create a watch on one PR")
     add.add_argument("target", nargs="?", help="owner/repo#number")
     add.add_argument("--purpose", default="tell me when required checks pass")
+    add.add_argument("--digest", default="off", choices=["off", "6h", "12h", "24h"],
+                     help="scheduled status heartbeat interval (default off)")
     add.add_argument("--intent", help="describe the watch in one sentence; a "
                      "configured model parses it into target + purpose")
     add.add_argument("--cadence", type=int, default=DEFAULT_CADENCE,
@@ -422,6 +425,7 @@ def _run_watch(args: argparse.Namespace) -> int:
                 target=target,
                 purpose=redactor.scrub(purpose),
                 cadence_seconds=args.cadence,
+                digest_interval_seconds=DIGEST_CHOICES[args.digest],
                 notification_conditions=args.notify,
                 stop_conditions=args.stop,
                 next_check_at=time.time(),
@@ -435,6 +439,9 @@ def _run_watch(args: argparse.Namespace) -> int:
         print(f"  target:                 {task.target}")
         print(f"  purpose:                {task.purpose}")
         print(f"  cadence:                every {task.cadence_seconds}s")
+        digest = task.digest_interval_seconds
+        shown = "off" if digest is None else f"{digest // 3600}h"
+        print(f"  digest:                 {shown}")
         print(f"  allowed actions:        read-only (no external writes)")
         if auth_mode == "anonymous":
             print("  GitHub access:          anonymous (public repositories only)")
@@ -497,6 +504,9 @@ def _run_watch(args: argparse.Namespace) -> int:
     print(f"  target:                 {task.target}")
     print(f"  purpose:                {task.purpose}")
     print(f"  cadence:                every {task.cadence_seconds}s")
+    digest = task.digest_interval_seconds
+    shown = "off" if digest is None else f"{digest // 3600}h"
+    print(f"  digest:                 {shown}")
     print(f"  allowed actions:        read-only")
     print(f"  notification conditions:{task.notification_conditions}")
     print(f"  stop conditions:        {task.stop_conditions}")

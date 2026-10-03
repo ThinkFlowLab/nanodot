@@ -32,6 +32,7 @@ MAX_BACKOFF_SECONDS = 3600
 PROLONGED_FAILURE_SECONDS = 3600
 SUMMARY_BUDGET_SECONDS = 1.0
 CHECK_OBSERVED = "check-observed"  # per-poll record of what the runner saw
+DIGEST_KIND = "digest"  # scheduled heartbeat (issue #80): notable, rule-proven
 OBSERVATION_RETENTION = 20  # recent per-poll digests kept per task
 
 
@@ -357,8 +358,57 @@ class TaskLoop:
             return RunOutcome.TERMINAL
 
         task.next_check_at = now + task.cadence_seconds
+        if task.digest_interval_seconds is not None:
+            digest = self._maybe_digest(task, snapshot, now)
+            if digest is not None:
+                if skipped := self._superseded(task):
+                    return skipped
+                self._record_event(digest)
+                self._sink.notify(digest)
         self._store.update(task)
         return RunOutcome.OK
+
+    def _maybe_digest(
+        self, task: Task, snapshot, now: float
+    ):
+        """The scheduled heartbeat: at most one digest per window, never on
+        the first poll (a full interval must elapse), carrying the same
+        observation the poll just recorded. The window number is the
+        occurrence identity, so the durable inbox dedups a crash-replay
+        within a window to exactly one delivery."""
+        interval = task.digest_interval_seconds
+        last = task.watch_state.get("last_digest_at")
+        if last is None:
+            task.watch_state["last_digest_at"] = now  # initialize; fire nothing
+            return None
+        if now - last < interval:
+            return None
+        task.watch_state["last_digest_at"] = now
+        outcome = "no check runs on the current commit yet"
+        runs = snapshot.checks_for(snapshot.head_sha)
+        if runs:
+            done = [r for r in runs if r.status == "completed"]
+            failing = [r for r in done if r.conclusion not in (None, "success", "skipped", "neutral")]
+            outcome = (
+                f"{len(done)}/{len(runs)} checks completed, {len(failing)} failing"
+                if done or runs
+                else outcome
+            )
+        return WatchEvent(
+            kind=DIGEST_KIND,
+            message=(
+                f"scheduled digest: {task.target} {snapshot.pr_state} at "
+                f"{snapshot.head_sha[:10]} — {outcome}"
+            ),
+            evidence={
+                **statemachine.observation(snapshot),
+                "rule": "notify: scheduled digest",
+            },
+            notable=True,
+            task_id=task.id,
+            at=now,
+            occurrence=f"digest-{int(now // interval)}",
+        )
 
     def _prune_observations(self, task_id: str) -> None:
         """Retention is best-effort: a failing prune must not fail the run."""
