@@ -13,7 +13,21 @@ from typing import Protocol
 
 class ProviderError(Exception):
     """Provider unavailable or returned something unusable. Callers must
-    degrade gracefully — the watch never depends on the model."""
+    degrade gracefully — the watch never depends on the model.
+
+    The structured fields let retry policy decide without matching prose:
+    ``status`` is the HTTP status when one was received, ``retryable``
+    marks transport-class failures, and ``retry_after`` carries a parsed
+    Retry-After delay in seconds when the provider supplied one.
+    """
+
+    def __init__(self, message: str, *, status: int | None = None,
+                 retryable: bool = False,
+                 retry_after: float | None = None) -> None:
+        super().__init__(message)
+        self.status = status
+        self.retryable = retryable
+        self.retry_after = retry_after
 
 
 @dataclass(frozen=True)

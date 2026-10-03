@@ -21,6 +21,11 @@ from nanodot.core.egress import EgressGuard
 from nanodot.core.redaction import Redactor
 from nanodot.native.secrets_file import FileSecretStore
 from nanodot.native.http import authenticated_urlopen
+from nanodot.native.providers.retry import (
+    RETRYABLE_STATUSES,
+    retry_after_seconds as _retry_after_seconds,
+)
+
 from nanodot.ports.inference import (
     InferenceProvider,
     ProviderError,
@@ -127,12 +132,20 @@ class APIInferenceProvider(InferenceProvider):
             _record_usage(self._name, self._usage, payload.get("usage") or {})
         except urllib.error.HTTPError as error:
             detail = self._scrub(error.read().decode(errors="replace"))[:200]
-            raise ProviderError(f"model API error {error.code}: {detail}") from error
+            retry_after = _retry_after_seconds(error.headers)
+            raise ProviderError(
+                f"model API error {error.code}: {detail}",
+                status=error.code,
+                retryable=error.code in RETRYABLE_STATUSES,
+                retry_after=retry_after,
+            ) from error
         except (urllib.error.URLError, TimeoutError, OSError, ValueError,
                 http.client.HTTPException) as error:
             # HTTPException (e.g. IncompleteRead on a truncated body) is a
             # routine transport failure, not an unhandled adapter error.
-            raise ProviderError(self._scrub(f"model API unreachable: {error}")) from error
+            raise ProviderError(
+                self._scrub(f"model API unreachable: {error}"), retryable=True
+            ) from error
         try:
             content = payload["choices"][0]["message"]["content"]
             if not isinstance(content, str):

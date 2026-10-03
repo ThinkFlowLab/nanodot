@@ -17,6 +17,11 @@ import urllib.request
 from nanodot.core.egress import EgressGuard
 from nanodot.core.redaction import Redactor
 from nanodot.native.http import authenticated_urlopen
+from nanodot.native.providers.retry import (
+    RETRYABLE_STATUSES,
+    retry_after_seconds as _retry_after_seconds,
+)
+
 from nanodot.ports.inference import (
     InferenceProvider,
     ProviderError,
@@ -111,12 +116,15 @@ class AnthropicProvider(InferenceProvider):
         except urllib.error.HTTPError as error:
             detail = self._scrub(error.read().decode(errors="replace"))[:200]
             raise ProviderError(
-                f"model API error {error.code}: {detail}"
+                f"model API error {error.code}: {detail}",
+                status=error.code,
+                retryable=error.code in RETRYABLE_STATUSES,
+                retry_after=_retry_after_seconds(error.headers),
             ) from error
         except (urllib.error.URLError, TimeoutError, OSError, ValueError,
                 http.client.HTTPException) as error:
             raise ProviderError(
-                self._scrub(f"model API unreachable: {error}")
+                self._scrub(f"model API unreachable: {error}"), retryable=True
             ) from error
         try:
             blocks = payload["content"]

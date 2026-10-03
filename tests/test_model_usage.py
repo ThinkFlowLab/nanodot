@@ -166,10 +166,14 @@ def test_configured_provider_reads_limit_from_config(home: Path, monkeypatch) ->
 
     providers._usage_store = ModelUsage(tzname="UTC")  # isolated home
     monkeypatch.setattr(providers, "shared_usage_store", lambda: providers._usage_store)
+    from nanodot.native.providers.retry import RetryingProvider
+
     provider = configured_provider()
-    assert isinstance(provider, APIInferenceProvider)
-    assert provider._daily_limit == 5
-    assert provider._usage is providers._usage_store
+    assert isinstance(provider, RetryingProvider)
+    adapter = provider._inner
+    assert isinstance(adapter, APIInferenceProvider)
+    assert adapter._daily_limit == 5
+    assert adapter._usage is providers._usage_store
 
 
 def test_limit_validation_at_set_time(home: Path) -> None:
