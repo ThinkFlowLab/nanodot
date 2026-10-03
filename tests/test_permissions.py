@@ -35,9 +35,12 @@ def test_github_client_exposes_only_fetch() -> None:
     assert public == {"fetch"}, public
 
 
-def test_no_write_http_verbs_outside_the_inference_provider() -> None:
-    """POST/PUT/PATCH/DELETE may exist only in the inference adapter —
-    the single egress point. Everything else issues GETs only."""
+def test_no_write_http_verbs_outside_the_write_port() -> None:
+    """Non-GET request construction exists only inside the write port's
+    native adapter (github_writer.py) plus the inference adapter — the two
+    declared egress sites. Everything else, including github_client.py,
+    issues GETs only (docs/design/github-writer.md, decision A1)."""
+    allowed = {"inference_api.py", "github_writer.py"}
     for py in SRC.rglob("*.py"):
         tree = ast.parse(py.read_text())
         for node in ast.walk(tree):
@@ -58,7 +61,7 @@ def test_no_write_http_verbs_outside_the_inference_provider() -> None:
                     None,
                 )
                 if method and method != "GET":
-                    assert py.name == "inference_api.py", (
+                    assert py.name in allowed, (
                         f"non-GET HTTP verb in {py.name}"
                     )
 

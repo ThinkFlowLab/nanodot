@@ -6,6 +6,8 @@ a future adapter would implement (docs/design/adapter-seam.md).
 
 from __future__ import annotations
 
+import hashlib
+import json
 import time
 
 from nanodot.core.tasks import PRTarget
@@ -17,6 +19,10 @@ from nanodot.ports.github import (
     RequiredCheck,
     Snapshot,
     SnapshotFetcher,
+)
+from nanodot.ports.github_writer import (
+    WriteContentMismatch,
+    WriteResult,
 )
 from nanodot.ports.inference import ProviderError, TaskDraft
 
@@ -137,3 +143,32 @@ TYPICAL_ERRORS = {
     "auth": AuthLostError("token revoked"),
     "missing": PRNotFoundError("PR deleted"),
 }
+
+
+class FakeGitHubWriter:
+    """Scriptable writer: records verified requests, returns canned results.
+
+    Mirrors the port contract — the content hash is enforced exactly like
+    the native adapter, so hash-mismatch cases fail closed here too.
+    """
+
+    def __init__(self) -> None:
+        self.executed: list[tuple] = []  # (capability, payload, sent_bytes)
+        self.results: list = []  # WriteResult | WriteError, consumed in order
+        self.hash_checks = 0
+
+    def respond_with(self, *outcomes) -> None:
+        self.results.extend(outcomes)
+
+    def execute(self, capability, payload):
+        canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+        self.hash_checks += 1
+        if hashlib.sha256(canonical.encode()).hexdigest() != capability.content_hash:
+            raise WriteContentMismatch("payload does not match the approved hash")
+        self.executed.append((capability, payload, canonical.encode()))
+        outcome = self.results.pop(0) if self.results else WriteResult(
+            action=capability.action, status=201, body={"ok": True}
+        )
+        if isinstance(outcome, Exception):
+            raise outcome
+        return outcome
