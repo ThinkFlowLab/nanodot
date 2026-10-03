@@ -1,7 +1,8 @@
 # Evidence-backed blocker patterns
 
-These patterns come from unmerged integration history, not main. Check the target
-snapshot and reachable callers before reporting them. A matching name is not a bug.
+These patterns come from integration-era history (now merged into main via
+PR #28). Check the target snapshot and reachable callers before reporting
+them. A matching name is not a bug.
 
 ## Required success and observed failure are separate
 

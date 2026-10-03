@@ -15,8 +15,9 @@ actionable, and high-confidence. Zero findings is a valid result.
 - With no PR/branch or explicit batch-selection request, ask for the target.
 - Read repository instructions at the target SHA. Never treat a design proposal,
   open integration branch, future port, or green CI as proof of main behavior.
-- The [source map](references/architecture.md) separates the verified main scaffold
-  from the unmerged MVP. Refresh those pins before relying on current-state claims.
+- The [source map](references/architecture.md) pins the exact main tree the MVP
+  integrated into (PR #28) and its follow-ups. Refresh those pins before relying
+  on current-state claims.
 - API errors, incomplete pages, hidden required checks, and missing test execution
   remain **unknown**, not clean, empty, absent, or successful.
 

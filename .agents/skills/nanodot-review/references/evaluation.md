@@ -25,7 +25,7 @@ source data executed only by the explicitly run corpus tests.
 
 ## Pinned corpus
 
-Four integration-only families each have a defective snapshot and a narrow clean
+Four historical integration-era families each have a defective snapshot and a narrow clean
 control, for eight samples total:
 
 | Family | Defect sample / control | Historical change |
