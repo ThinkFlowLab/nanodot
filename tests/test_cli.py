@@ -299,7 +299,7 @@ def test_approvals_approve_and_denied_never_reasked(
     center = PermissionCenter()
     request = center.request(
         action="comment", target=TARGET, scope="watch:s1",
-        task_id="task-1", content="the exact approved text",
+        task_id="task-1", content={"body": "the exact approved text"},
     )
 
     assert main(["approvals", "list"]) == 0
@@ -317,12 +317,12 @@ def test_approvals_approve_and_denied_never_reasked(
     # Denial of a second request is terminal: no verbatim re-ask.
     second = center.request(
         action="comment", target=TARGET, scope="watch:s1",
-        task_id="task-1", content="the exact approved text",
+        task_id="task-1", content={"body": "the exact approved text"},
     )
     assert main(["approvals", "deny", second.id]) == 0
     assert "denied" in capsys.readouterr().out
-    from nanodot.core.permissions import content_digest
+    from nanodot.ports.github_writer import payload_digest
 
     assert center.has_verbatim_request(
-        "task-1", content_digest("the exact approved text")
+        "task-1", payload_digest({"body": "the exact approved text"})
     ) == "denied"

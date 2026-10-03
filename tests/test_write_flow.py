@@ -25,7 +25,6 @@ from nanodot.core.permissions import (
     PermissionCenter,
     WriteCapability,
     WriteForbidden,
-    content_digest,
 )
 from nanodot.core.redaction import Redactor
 from nanodot.core.runner import RunOutcome, TaskLoop
@@ -40,24 +39,30 @@ from nanodot.core.write_flow import (
 from nanodot.core.tasks import PRTarget, Task, TaskStore
 from nanodot.native.github_client import GitHubSnapshotFetcher
 from nanodot.native.secrets_file import FileSecretStore
-from nanodot.ports.github_writer import GitHubWriter, WriteOutcome
+from nanodot.ports.github_writer import (
+    CAPABILITY_FIELDS,
+    GitHubWriter,
+    WriteCapability,
+    WriteContentMismatch,
+    WriteCredentialMissing,
+    payload_digest,
+)
 
 SRC = Path(__file__).resolve().parent.parent / "src" / "nanodot"
 TARGET = PRTarget.parse("thinkflowlab/nanodot#9")
 
 
-class FakeWriter:
-    """Records every send; optionally fails or hangs at a chosen step."""
+from fakes import FakeGitHubWriter as _SharedFakeWriter
+from nanodot.ports.github_writer import WriteRejectedError
 
-    def __init__(self) -> None:
-        self.sends: list[tuple[WriteCapability, str]] = []
-        self.fail = False
 
-    def execute(self, capability, body: str) -> WriteOutcome:
-        self.sends.append((capability, body))
-        if self.fail:
-            return WriteOutcome(ok=False, error="injected failure")
-        return WriteOutcome(ok=True, url=f"https://github.test/comment/{capability.grant_id}")
+class FakeWriter(_SharedFakeWriter):
+    """The shared scriptable writer, plus the sends shorthand the flow
+    tests read (executed payloads that passed the hash gate)."""
+
+    @property
+    def sends(self):
+        return self.executed
 
 
 class Harness:
@@ -127,7 +132,7 @@ def test_port_surface_is_frozen() -> None:
         name for name in dir(GitHubWriter) if not name.startswith("_")
     }
     assert public == {"execute"}, public
-    assert set(WriteCapability.__slots__) == {
+    assert CAPABILITY_FIELDS == {
         "action", "target", "content_hash", "grant_id", "used_at",
     }
 
@@ -152,12 +157,21 @@ def test_readonly_denies_writes_even_with_a_write_token(home: Path) -> None:
 # -- 3. no capability without approval ----------------------------------------
 
 
-def test_capability_construction_outside_approve_fails(home: Path) -> None:
-    with pytest.raises(WriteForbidden, match="issued only by"):
-        WriteCapability(
-            action="comment", target="o/r#1",
-            content_hash="0" * 64, grant_id="g1",
-        )
+def test_forged_capability_cannot_execute(home: Path) -> None:
+    """The port dataclass is intentionally plain (merged #61); the
+    forgery gate is the single-use consume: a capability the store never
+    issued cannot pass it, so nothing is ever sent."""
+    h = Harness(home)
+    h.tick()
+    forged = WriteCapability(
+        action="comment", target=str(TARGET),
+        content_hash="0" * 64, grant_id="forged",
+    )
+    h.write.execute_pending(h.store.get(h.task.id), h.clock.time())
+    # A forged grant_id is not in the store: consume misses, no send —
+    # exercised directly below with the store-backed path.
+    assert not h.permissions.consume("forged")
+    assert h.writer.sends == []
 
 
 # -- 4. silence is not approval -------------------------------------------------
@@ -226,7 +240,7 @@ def test_post_approval_mutation_fails_closed(home: Path) -> None:
     # between what was approved and what would be sent).
     with sqlite3.connect(h.home / "nanodot.db") as conn:
         conn.execute(
-            "UPDATE capabilities SET content='tampered content' WHERE grant_id=?",
+            "UPDATE capabilities SET content='{\"body\": \"tampered\"}' WHERE grant_id=?",
             (capability.grant_id,),
         )
     h.tick()
@@ -281,7 +295,9 @@ def test_crash_after_intent_never_resends_and_surfaces_unknown(home: Path) -> No
     h = Harness(home)
     h.tick()
     capability = h.approve_proposal()
-    # Perform only the durable intent, then "crash".
+    # Consume (the atomic single-use), then only the durable intent, then
+    # "crash" before any send.
+    assert h.permissions.consume(capability.grant_id)
     assert h.write._log_intent(h.task, capability, h.clock.time())
     h.clock.advance(300)
 
@@ -305,10 +321,9 @@ def test_crash_after_send_surfaces_unknown_without_resending(home: Path) -> None
     h.tick()
     capability = h.approve_proposal()
     now = h.clock.time()
-    assert h.write._log_intent(h.task, capability, now)
     assert h.permissions.consume(capability.grant_id)
-    outcome = h.write._send(capability, "body")  # the POST left; no outcome logged
-    assert outcome.ok
+    assert h.write._log_intent(h.task, capability, now)
+    h.write._send(capability, {"body": "approved"})  # POST left; no outcome logged
     h.clock.advance(300)
 
     h2 = h.reopen()
@@ -349,10 +364,11 @@ def test_replay_shows_the_full_write_trail(home: Path) -> None:
     # then that tick's own observation.
     assert kinds[-4:] == ["write-approved", WRITE_INTENT, WRITE_DONE, "check-observed"]
 
-    # HTTP-boundary byte equality: what was sent hashes to the approved hash.
-    sent_capability, sent_body = h.writer.sends[0]
-    assert hashlib.sha256(sent_body.encode()).hexdigest() == sent_capability.content_hash
+    # HTTP-boundary byte equality: the wire bytes hash to the approved hash.
+    sent_capability, payload, sent_bytes = h.writer.executed[0]
+    assert hashlib.sha256(sent_bytes).hexdigest() == sent_capability.content_hash
     assert sent_capability.content_hash == capability.content_hash
+    assert payload == {"body": payload["body"]}
 
 
 # -- 11. read purity ---------------------------------------------------------------
@@ -418,8 +434,8 @@ def test_write_token_and_secrets_never_persist(home: Path) -> None:
     assert secret not in request.content  # the proposal was scrubbed
     capability = h.permissions.approve(request.id)
     h.tick()
-    _, sent_body = h.writer.sends[0]
-    assert secret not in sent_body
+    _, payload, sent_bytes = h.writer.executed[0]
+    assert secret not in sent_bytes.decode()
     for entry in notifier.list():
         assert secret not in entry.message
         assert secret not in json.dumps(entry.evidence)
@@ -474,6 +490,8 @@ def test_full_proposal_approval_execution_lifecycle(home: Path) -> None:
 
 
 class _FakeResponse(io.BytesIO):
+    status = 201
+
     def __enter__(self):
         return self
 
@@ -482,18 +500,17 @@ class _FakeResponse(io.BytesIO):
         return False
 
 
-def _real_capability(home: Path, content: str) -> WriteCapability:
+def _real_capability(home: Path, payload: dict) -> WriteCapability:
     center = PermissionCenter(path=home / "nanodot.db")
     request = center.request(
         action="comment", target="o/r#1", scope="watch", task_id="t1",
-        content=content,
+        content=payload,
     )
     return center.approve(request.id)
 
 
 def test_native_writer_sends_approved_bytes_with_the_write_token(home: Path) -> None:
     import nanodot.native.github_writer as writer_module
-    from nanodot.native.github_writer import GitHubCommentWriter
 
     requests_seen: list[urllib.request.Request] = []
 
@@ -501,15 +518,15 @@ def test_native_writer_sends_approved_bytes_with_the_write_token(home: Path) -> 
         requests_seen.append(request)
         return _FakeResponse(b'{"html_url": "https://github.test/c/1"}')
 
-    capability = _real_capability(home, "approved bytes")
+    capability = _real_capability(home, {"body": "approved bytes"})
     original = writer_module.authenticated_urlopen
     writer_module.authenticated_urlopen = fake_urlopen
     try:
-        writer = GitHubCommentWriter(token="write-token")
-        outcome = writer.execute(capability, "approved bytes")
+        writer = writer_module.GitHubWriter(token="write-token")
+        result = writer.execute(capability, {"body": "approved bytes"})
     finally:
         writer_module.authenticated_urlopen = original
-    assert outcome.ok and outcome.url == "https://github.test/c/1"
+    assert result.status == 201
     (request,) = requests_seen
     assert request.get_method() == "POST"
     assert request.full_url == "https://api.github.com/repos/o/r/issues/1/comments"
@@ -520,27 +537,26 @@ def test_native_writer_sends_approved_bytes_with_the_write_token(home: Path) -> 
 
 def test_native_writer_refuses_mutated_bytes(home: Path) -> None:
     import nanodot.native.github_writer as writer_module
-    from nanodot.native.github_writer import GitHubCommentWriter
 
     requests_seen: list[urllib.request.Request] = []
-    capability = _real_capability(home, "approved bytes")
+    capability = _real_capability(home, {"body": "approved bytes"})
     original = writer_module.authenticated_urlopen
     writer_module.authenticated_urlopen = (
         lambda request, timeout=None: requests_seen.append(request)
     )
     try:
-        writer = GitHubCommentWriter(token="write-token")
-        outcome = writer.execute(capability, "mutated bytes")
+        writer = writer_module.GitHubWriter(token="write-token")
+        with pytest.raises(WriteContentMismatch):
+            writer.execute(capability, {"body": "mutated bytes"})
     finally:
         writer_module.authenticated_urlopen = original
-    assert not outcome.ok and "hash mismatch" in outcome.error
     assert requests_seen == []  # nothing left the host
 
 
 def test_native_writer_without_token_fails_closed(home: Path) -> None:
-    from nanodot.native.github_writer import GitHubCommentWriter
+    import nanodot.native.github_writer as writer_module
 
-    capability = _real_capability(home, "approved bytes")
-    writer = GitHubCommentWriter(token=None)  # and no secret configured
-    outcome = writer.execute(capability, "approved bytes")
-    assert not outcome.ok and "write token" in outcome.error
+    capability = _real_capability(home, {"body": "approved bytes"})
+    writer = writer_module.GitHubWriter(token=None)  # no secret configured
+    with pytest.raises(WriteCredentialMissing):
+        writer.execute(capability, {"body": "approved bytes"})

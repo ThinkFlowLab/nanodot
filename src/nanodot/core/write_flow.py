@@ -12,16 +12,16 @@ import logging
 from typing import Callable
 
 from nanodot.core.activity import ActivityLog
-from nanodot.core.permissions import (
-    Mode,
-    PermissionCenter,
-    WriteCapability,
-    content_digest,
-)
+from nanodot.core.permissions import Mode, PermissionCenter
 from nanodot.core.redaction import Redactor
 from nanodot.core.statemachine import CHECKS_FAILED, WatchEvent
 from nanodot.core.tasks import Task
-from nanodot.ports.github_writer import GitHubWriter, WriteOutcome
+from nanodot.ports.github_writer import (
+    GitHubWriter,
+    WriteCapability,
+    WriteError,
+    payload_digest,
+)
 
 COMMENT_ACTION = "comment"
 # The one implemented write action, scoped to the watch's own target.
@@ -38,9 +38,10 @@ WRITE_UNKNOWN = "write-unknown"
 _RECOVERY_SCAN = (WRITE_INTENT, WRITE_DONE, WRITE_FAILED, WRITE_UNKNOWN)
 
 
-def draft_failure_comment(task: Task, event: WatchEvent) -> str:
-    """Deterministic, rule-drafted content from evidence already in hand.
-    Same evidence in, same bytes out — the approval hash is stable."""
+def draft_failure_comment(task: Task, event: WatchEvent) -> dict:
+    """Deterministic, rule-drafted payload from evidence already in hand.
+    Same evidence in, same canonical bytes out — the approval hash and the
+    wire body share this dict (payload_digest)."""
     sha = str(event.evidence.get("head_sha", ""))[:10] or "unknown head"
     failing = [
         str(check.get("name", ""))
@@ -48,11 +49,12 @@ def draft_failure_comment(task: Task, event: WatchEvent) -> str:
         if check.get("conclusion") == "failure"
     ]
     names = ", ".join(name for name in failing if name) or "unspecified checks"
-    return (
+    body = (
         f"[nanodot automated watch] Required checks failing on {sha} "
         f"for {task.target}: {names}. Watching continues until they pass "
         f"or the PR merges or closes."
     )
+    return {"body": body}
 
 
 class WriteFlow:
@@ -85,8 +87,9 @@ class WriteFlow:
             self._permissions.assert_allowed(COMMENT_ACTION)
         except Exception:
             return None
-        content = self._redactor.scrub(draft_failure_comment(task, event))
-        digest = content_digest(content)
+        payload = draft_failure_comment(task, event)
+        payload["body"] = self._redactor.scrub(payload["body"])
+        digest = payload_digest(payload)
         prior = self._permissions.has_verbatim_request(task.id, digest)
         if prior in ("pending", "denied"):
             return None  # never duplicate a pending ask, never re-ask a denial
@@ -96,7 +99,7 @@ class WriteFlow:
             target=str(task.target),
             scope=scope_hint,
             task_id=task.id,
-            content=content,
+            content=payload,
         )
         proposed = WatchEvent(
             kind=WRITE_PROPOSED,
@@ -109,7 +112,7 @@ class WriteFlow:
                 "action": COMMENT_ACTION,
                 "target": str(task.target),
                 "content_hash": digest,
-                "content": content,
+                "content": payload["body"],
             },
             notable=True,
             task_id=task.id,
@@ -129,30 +132,34 @@ class WriteFlow:
         durable intent → single-use consume → send → outcome. Any doubt
         fails closed with nothing sent."""
         events: list[WatchEvent] = []
-        for capability, content in self._permissions.pending_capabilities(task.id):
+        for capability, payload in self._permissions.pending_capabilities(task.id):
             if superseded is not None and superseded():
                 return events
-            if content_digest(content) != capability.content_hash:
+            if payload_digest(payload) != capability.content_hash:
                 # The stored payload no longer matches what was approved.
-                outcome = WriteOutcome(ok=False, error="content hash mismatch")
-                events.append(self._finish(task, capability, outcome, now))
+                events.append(self._finish(task, capability, "content hash mismatch", now))
                 continue
+            # The single-use consume is the forgery gate: only a capability
+            # the store actually issued (and no one has used) is sendable.
+            if not self._permissions.consume(capability.grant_id):
+                continue  # forged, lost the race, or replayed: never send
             if not self._log_intent(task, capability, now):
                 continue  # no durable intent, no send — fail closed
-            if not self._permissions.consume(capability.grant_id):
-                continue  # lost the single-use race or replayed: never send
             if superseded is not None and superseded():
                 return events  # consumed but unsent: recovery owns the doubt
-            outcome = self._send(capability, content)
-            events.append(self._finish(task, capability, outcome, now))
+            events.append(self._finish(task, capability, self._send(capability, payload), now))
         return events
 
-    def _send(self, capability: WriteCapability, content: str) -> WriteOutcome:
+    def _send(self, capability: WriteCapability, payload: dict) -> str:
+        """Returns an error string; an empty string means the write left."""
         try:
-            return self._writer.execute(capability, content)
+            self._writer.execute(capability, payload)
+            return ""
+        except WriteError as error:
+            return type(error).__name__
         except Exception:
             # A misbehaving writer is an outcome, never a crash of the run.
-            return WriteOutcome(ok=False, error="writer transport failed")
+            return "writer failed"
 
     def _log_intent(self, task: Task, capability: WriteCapability, now: float) -> bool:
         """The intent must be durable before the POST: a failed append
@@ -180,16 +187,16 @@ class WriteFlow:
 
     def _finish(
         self, task: Task, capability: WriteCapability,
-        outcome: WriteOutcome, now: float,
+        error: str, now: float,
     ) -> WatchEvent:
-        if outcome.ok:
+        if not error:
             event = WatchEvent(
                 kind=WRITE_DONE,
                 message=f"comment posted on {capability.target}",
+                # url: the result body is provider-shaped; the trail is the log
                 evidence={
                     "grant_id": capability.grant_id,
                     "content_hash": capability.content_hash,
-                    "url": outcome.url or "",
                 },
                 notable=True,
                 task_id=task.id,
@@ -199,7 +206,7 @@ class WriteFlow:
         else:
             event = WatchEvent(
                 kind=WRITE_FAILED,
-                message=f"comment on {capability.target} failed: {outcome.error}",
+                message=f"comment on {capability.target} failed: {error}",
                 evidence={
                     "grant_id": capability.grant_id,
                     "content_hash": capability.content_hash,

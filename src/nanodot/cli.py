@@ -167,10 +167,10 @@ def _wiring(teardown: Teardown | None = None) -> tuple:
     center = PermissionCenter()
     own("permission-center", center.close)
     if center.mode() is Mode.GATED:
-        from nanodot.native.github_writer import GitHubCommentWriter
+        from nanodot.native.github_writer import GitHubWriter
 
         write = WriteFlow(
-            center, GitHubCommentWriter(), activity, redactor=redactor,
+            center, GitHubWriter(), activity, redactor=redactor,
         )
     loop = TaskLoop(
         store, fetcher, sink, activity,

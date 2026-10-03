@@ -20,12 +20,14 @@ capability — by construction, not convention.
    requires hash equality with the approved payload. Approved-then-mutated
    content fails closed (TOCTOU).
 3. **Capability, single-use.** `PermissionCenter.approve()` issues a
-   one-shot `WriteCapability(action, target, content_hash, grant_id)`;
-   single-use is enforced by an atomic `UPDATE … WHERE used_at IS NULL`.
-   The writer port's only public method is
-   `execute(capability, payload)`: verify hash, send, mark used. Core
-   cannot call the writer without a capability; a capability cannot exist
-   without an approval.
+   one-shot `WriteCapability(action, target, content_hash, grant_id)` —
+   the frozen port dataclass from #61; single-use is enforced by an
+   atomic `UPDATE … WHERE used_at IS NULL`, which doubles as the forgery
+   gate: a capability the store never issued cannot be consumed and so
+   is never sent. The writer port's only public method is
+   `execute(capability, payload)` — canonical-JSON payload, hash verified
+   at the wire. Core cannot call the writer without a capability; a
+   capability cannot execute without the store.
 4. **Self-approval is structurally absent.** `approve()` is called only by
    the CLI; no runner/loop/core path approves anything, ever. (Structural
    test in the acceptance list.)
@@ -81,8 +83,9 @@ method or capability field fails this test until this document changes.
 **Gate invariants.**
 - READONLY regression: `assert_allowed` raises for every write action,
   including with a write token configured.
-- No capability without approval: construction outside
-  `PermissionCenter.approve()` fails.
+- No capability without approval: the port dataclass is plain by design
+  (#61 froze it), so the gate is the single-use consume — a capability
+  the store never issued cannot pass `consume()` and is never sent.
 - Silence ≠ approval: an expired request issues no capability; the
   re-request path is exercised.
 - Single-use: replaying a used capability fails; concurrent double-execute

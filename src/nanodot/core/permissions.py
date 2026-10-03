@@ -14,7 +14,7 @@ actions, and execution still requires a capability that only
 
 from __future__ import annotations
 
-import hashlib
+import json
 import sqlite3
 import threading
 import time
@@ -25,13 +25,9 @@ from pathlib import Path
 
 from nanodot.core.config import Config
 from nanodot.paths import database_path
+from nanodot.ports.github_writer import WriteCapability, payload_digest
 
 DEFAULT_REQUEST_TTL_SECONDS = 24 * 3600
-
-
-def content_digest(content: str) -> str:
-    """The approval-binding hash of a write payload (hex sha256)."""
-    return hashlib.sha256(content.encode()).hexdigest()
 
 
 class WriteForbidden(PermissionError):
@@ -74,48 +70,6 @@ class ApprovalRequest:
     state: str  # pending | approved | denied | expired
     content_hash: str = ""  # binds the exact payload a write may send
     content: str = ""  # the payload the user saw when approving
-
-_ISSUER = object()  # module-private: only approve() may construct a capability
-
-
-class WriteCapability:
-    """Single-use authorization for one exact write: action + target +
-    content hash, tied to its grant. Constructible only by
-    ``PermissionCenter.approve()``; ``used_at`` reflects consumption in
-    the store, and no code path may send without one."""
-
-    __slots__ = ("action", "target", "content_hash", "grant_id", "used_at")
-
-    def __init__(
-        self,
-        *,
-        action: str,
-        target: str,
-        content_hash: str,
-        grant_id: str,
-        used_at: float | None = None,
-        _issuer: object = None,
-    ) -> None:
-        if _issuer is not _ISSUER:
-            raise WriteForbidden(
-                "a WriteCapability is issued only by PermissionCenter.approve()"
-            )
-        object.__setattr__(self, "action", action)
-        object.__setattr__(self, "target", target)
-        object.__setattr__(self, "content_hash", content_hash)
-        object.__setattr__(self, "grant_id", grant_id)
-        object.__setattr__(self, "used_at", used_at)
-
-    def __setattr__(self, name: str, value: object) -> None:
-        raise AttributeError("WriteCapability is immutable")
-
-    def __repr__(self) -> str:  # pragma: no cover - debugging aid
-        return (
-            f"WriteCapability(action={self.action!r}, target={self.target!r}, "
-            f"content_hash={self.content_hash[:12]}…, grant_id={self.grant_id!r}, "
-            f"used_at={self.used_at!r})"
-        )
-
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS grants (
@@ -245,12 +199,14 @@ class PermissionCenter:
         target: str,
         scope: str,
         task_id: str,
-        content: str = "",
+        content: dict | None = None,
         ttl: float = DEFAULT_REQUEST_TTL_SECONDS,
     ) -> ApprovalRequest:
-        """Record what action is wanted, binding the exact content a write
-        may send. Silence never approves: it expires."""
+        """Record what action is wanted, binding the exact payload a write
+        may send (canonical JSON shared with the wire). Silence never
+        approves: it expires."""
         now = self._clock.time()
+        stored = payload_digest(content) if content is not None else ""
         req = ApprovalRequest(
             id=uuid.uuid4().hex[:12],
             action=action,
@@ -260,8 +216,8 @@ class PermissionCenter:
             created_at=now,
             expires_at=now + ttl,
             state="pending",
-            content_hash=content_digest(content) if content else "",
-            content=content,
+            content_hash=stored,
+            content=json.dumps(content, sort_keys=True, separators=(",", ":")) if content is not None else "",
         )
         with self._lock:
             self._conn.execute(
@@ -329,7 +285,6 @@ class PermissionCenter:
             target=req.target,
             content_hash=req.content_hash,
             grant_id=grant_id,
-            _issuer=_ISSUER,
         )
 
     # -- capabilities --------------------------------------------------------
@@ -365,9 +320,8 @@ class PermissionCenter:
                 WriteCapability(
                     action=row["action"], target=row["target"],
                     content_hash=row["content_hash"], grant_id=row["grant_id"],
-                    _issuer=_ISSUER,
                 ),
-                row["content"],
+                json.loads(row["content"]) if row["content"] else {},
             )
             for row in rows
         ]
