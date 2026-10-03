@@ -106,6 +106,7 @@ class Task:
     next_check_at: float | None = None
     digest_interval_seconds: int | None = None  # None = no scheduled digest
     stale_after_seconds: int | None = None  # None = no stale alert
+    flaky_detection: bool = False  # pass/fail flip alerts; off by default
     watch_state: dict = field(default_factory=dict)
     id: str = field(default_factory=lambda: uuid.uuid4().hex[:12])
 
@@ -164,6 +165,7 @@ CREATE TABLE IF NOT EXISTS tasks (
   next_check_at REAL,
   digest_interval_seconds INTEGER,
   stale_after_seconds INTEGER,
+  flaky_detection INTEGER NOT NULL DEFAULT 0,
   watch_state TEXT NOT NULL DEFAULT '{}'
 );
 """
@@ -188,7 +190,7 @@ class TaskStore:
         with self._lock:
             self._conn.executescript(_SCHEMA)
             self._ensure_digest_column()
-            self._ensure_stale_column()
+            self._ensure_watch_kind_columns()
             self._conn.commit()
 
     def _ensure_digest_column(self) -> None:
@@ -201,14 +203,19 @@ class TaskStore:
                 "ALTER TABLE tasks ADD COLUMN digest_interval_seconds INTEGER"
             )
 
-    def _ensure_stale_column(self) -> None:
-        """Additive migration (legacy rows keep NULL = stale off)."""
+    def _ensure_watch_kind_columns(self) -> None:
+        """Additive migrations (legacy rows keep NULL/0 = both kinds off)."""
         columns = {
             row["name"] for row in self._conn.execute("PRAGMA table_info(tasks)")
         }
         if "stale_after_seconds" not in columns:
             self._conn.execute(
                 "ALTER TABLE tasks ADD COLUMN stale_after_seconds INTEGER"
+            )
+        if "flaky_detection" not in columns:
+            self._conn.execute(
+                "ALTER TABLE tasks ADD COLUMN "
+                "flaky_detection INTEGER NOT NULL DEFAULT 0"
             )
 
     # -- mapping helpers -------------------------------------------------
@@ -236,6 +243,7 @@ class TaskStore:
             next_check_at=row["next_check_at"],
             digest_interval_seconds=row["digest_interval_seconds"],
             stale_after_seconds=row["stale_after_seconds"],
+            flaky_detection=bool(row["flaky_detection"]),
             watch_state=json.loads(row["watch_state"]),
         )
 
@@ -256,6 +264,7 @@ class TaskStore:
             task.next_check_at,
             task.digest_interval_seconds,
             task.stale_after_seconds,
+            int(task.flaky_detection),
             json.dumps(task.watch_state),
         )
 
@@ -276,7 +285,7 @@ class TaskStore:
         try:
             with self._lock, self._conn:
                 self._conn.execute(
-                    "INSERT INTO tasks VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    "INSERT INTO tasks VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                     self._task_to_values(task),
                 )
         except sqlite3.IntegrityError as error:
@@ -344,7 +353,7 @@ class TaskStore:
                 "UPDATE tasks SET target=?, purpose=?, cadence_seconds=?, "
                 "allowed_actions=?, notification_conditions=?, stop_conditions=?, "
                 "state=?, blocker=?, scope_version=?, created_at=?, updated_at=?, "
-                "next_check_at=?, digest_interval_seconds=?, stale_after_seconds=?, watch_state=? WHERE id=?",
+                "next_check_at=?, digest_interval_seconds=?, stale_after_seconds=?, flaky_detection=?, watch_state=? WHERE id=?",
                 self._task_to_values(task)[1:] + (task.id,),
             )
         return task

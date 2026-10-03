@@ -82,6 +82,10 @@ def build_parser() -> argparse.ArgumentParser:
         choices=["off", "2d", "3d", "7d", "14d"],
         help="idle alert: one notification when the head sits unchanged",
     )
+    add.add_argument(
+        "--flaky", default="off", choices=["on", "off"],
+        help="flaky-check alerts: a check passing and failing on one commit",
+    )
 
     # -- memory ------------------------------------------------------------
     memory = subparsers.add_parser("memory", help="what nanodot retained, and why")
@@ -439,6 +443,7 @@ def _run_watch(args: argparse.Namespace) -> int:
                 stop_conditions=args.stop,
                 digest_interval_seconds=digest_map[args.digest],
                 stale_after_seconds=stale_map[args.stale],
+                flaky_detection=(args.flaky == "on"),
                 next_check_at=time.time(),
             )
             task.validate()
@@ -454,6 +459,7 @@ def _run_watch(args: argparse.Namespace) -> int:
             print(f"  digest:                 every {task.digest_interval_seconds}s")
         if task.stale_after_seconds is not None:
             print(f"  stale alert:            after {task.stale_after_seconds}s idle")
+            print(f"  flaky-check alerts:     {args.flaky}")
         print(f"  allowed actions:        read-only (no external writes)")
         if auth_mode == "anonymous":
             print("  GitHub access:          anonymous (public repositories only)")
@@ -520,6 +526,7 @@ def _run_watch(args: argparse.Namespace) -> int:
         print(f"  digest:                 every {task.digest_interval_seconds}s")
     if task.stale_after_seconds is not None:
         print(f"  stale alert:            after {task.stale_after_seconds}s idle")
+    print(f"  flaky-check alerts:     {'on' if task.flaky_detection else 'off'}")
     print(f"  allowed actions:        read-only")
     print(f"  notification conditions:{task.notification_conditions}")
     print(f"  stop conditions:        {task.stop_conditions}")

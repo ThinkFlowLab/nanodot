@@ -34,6 +34,8 @@ SUMMARY_BUDGET_SECONDS = 1.0
 CHECK_OBSERVED = "check-observed"  # per-poll record of what the runner saw
 DIGEST = "digest"  # scheduled status heartbeat (issue #80)
 STALE = "stale"  # once-per-commit idle alert (issue #84)
+FLAKY = "flaky"  # pass/fail flip on one commit (issue #87)
+_FLAKY_FAILURES = frozenset({"failure", "timed_out"})  # cancelled is operator action
 OBSERVATION_RETENTION = 20  # recent per-poll digests kept per task
 
 
@@ -337,6 +339,9 @@ class TaskLoop:
         if task.stale_after_seconds is not None:
             if self._superseded(task) is None:
                 self._maybe_stale(task, snapshot, events, now)
+        if task.flaky_detection:
+            if self._superseded(task) is None:
+                self._maybe_flaky(task, snapshot, events, now)
 
         terminal = any(event.terminal for event in events)
         if terminal:
@@ -450,6 +455,58 @@ class TaskLoop:
         )
         self._record_event(stale)
         self._sink.notify(stale)
+
+    def _maybe_flaky(self, task: Task, snapshot, events: list, now: float) -> None:
+        """Pass/fail flip detection: exactly one flaky event per (commit,
+        check name), from completed conclusions accumulated on the current
+        head SHA. A new commit re-arms everything; the durable inbox
+        dedups any replay."""
+        state = task.watch_state
+        flaky_state = state.get("flaky")
+        if not isinstance(flaky_state, dict) or flaky_state.get("sha") != snapshot.head_sha:
+            flaky_state = {"sha": snapshot.head_sha, "seen": {}, "fired": []}
+        seen: dict = flaky_state["seen"]
+        for run in snapshot.checks_for(snapshot.head_sha):
+            if run.status != "completed" or run.conclusion is None:
+                continue  # only completed conclusions are evidence
+            if run.conclusion == "success":
+                seen.setdefault(run.name, {"success": False, "failure": False})
+                seen[run.name]["success"] = True
+            elif run.conclusion in _FLAKY_FAILURES:
+                seen.setdefault(run.name, {"success": False, "failure": False})
+                seen[run.name]["failure"] = True
+            # cancelled/skipped/neutral record nothing (operator or config
+            # action, not flaky evidence)
+        task.watch_state = dict(state, flaky=flaky_state)
+
+        if any(event.terminal for event in events):
+            return  # the terminal notification already fires this tick
+        fired = list(flaky_state["fired"])
+        for name, pair in sorted(seen.items()):
+            if not (pair["success"] and pair["failure"]) or name in fired:
+                continue
+            fired.append(name)
+            flaky_state["fired"] = fired
+            flaky = WatchEvent(
+                kind=FLAKY,
+                message=(
+                    f"flaky: check {name!r} on {task.target} "
+                    f"{snapshot.head_sha[:10]} passed and failed across "
+                    "re-runs of the same commit"
+                ),
+                evidence={
+                    **statemachine.observation(snapshot),
+                    "rule": "notify: flaky check",
+                    "check": name,
+                    "observed": ["success", "failure"],
+                },
+                notable=True,
+                task_id=task.id,
+                at=now,
+                occurrence=f"flaky-{snapshot.head_sha[:10]}-{name}",
+            )
+            self._record_event(flaky)
+            self._sink.notify(flaky)
 
     def _prune_observations(self, task_id: str) -> None:
         """Retention is best-effort: a failing prune must not fail the run."""
