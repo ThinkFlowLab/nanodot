@@ -6,9 +6,9 @@ write credential (never the read token), and never along a redirect —
 the same no-redirect policy as reads (``native/http.py``). Without a
 configured credential every call raises before any socket is opened.
 
-The action table maps an approved action to its verb and API path; it is
-empty until the first write action lands (#54). Tests may pass their own
-table so the transport is exercisable offline without inventing actions.
+The action table maps an approved action to its verb and API path;
+``comment`` is the first registered action (docs/design/github-writer.md
+§A6); tests may pass their own table.
 """
 
 from __future__ import annotations
@@ -52,6 +52,48 @@ def _resolve(template: str, target: PRTarget) -> str:
     if ".." in path or "://" in path or not path.startswith("/"):
         raise WriteActionUnknown("action path escapes the pinned destination")
     return path
+
+
+def probe_write_token(
+    token: str, base_url: str = API_BASE, timeout: float = 15.0
+) -> dict:
+    """Read-only credential probe for a candidate write token: GET /user.
+
+    Confirms GitHub accepts the credential before it is stored. GitHub's
+    REST API does not expose a fine-grained PAT's permission set, so the
+    per-repository, comment-only scoping is enforced where the token is
+    created (docs/design/github-writer.md, decision B); everything here
+    fails closed on anything but a clean 200. A GET only — the probe can
+    never write.
+    """
+    request = urllib.request.Request(
+        f"{base_url.rstrip('/')}/user",
+        headers={
+            "Accept": "application/vnd.github+json",
+            "Authorization": f"Bearer {token}",
+        },
+        method="GET",
+    )
+    try:
+        with authenticated_urlopen(request, timeout=timeout) as response:
+            raw = response.read().decode()
+            return json.loads(raw) if raw.strip() else {}
+    except urllib.error.HTTPError as error:
+        detail = error.read().decode(errors="replace")[:200]
+        if 300 <= error.code < 400:
+            raise WriteTransportError(
+                f"credential probe redirected ({error.code}); "
+                "redirects are disabled"
+            ) from error
+        if 400 <= error.code < 500:
+            raise WriteRejectedError(
+                f"GitHub rejected the write token ({error.code}): {detail}"
+            ) from error
+        raise WriteTransportError(
+            f"cannot verify the write token ({error.code}): {detail}"
+        ) from error
+    except (urllib.error.URLError, TimeoutError, OSError, ValueError) as error:
+        raise WriteTransportError(f"cannot verify the write token: {error}") from error
 
 
 class GitHubWriter:
