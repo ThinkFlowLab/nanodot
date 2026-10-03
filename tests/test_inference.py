@@ -333,6 +333,9 @@ def test_cli_runner_wiring_uses_configured_provider(home, monkeypatch):
     monkeypatch.setattr("nanodot.native.inference_api.configured_provider", lambda: provider)
     monkeypatch.setattr("nanodot.native.github_client.GitHubSnapshotFetcher", lambda: github)
     monkeypatch.setattr("nanodot.native.notifier.NativeNotifier", lambda **kwargs: sink)
+    # Provider wiring only: keep the write flow (auto default) out of the sink.
+    from nanodot.core.config import Config
+    Config().set("permission-mode", "readonly")
 
     _, store, _, _, _, loop = _wiring()
     task = store.create(Task(target=TARGET, purpose="watch", next_check_at=0.0))

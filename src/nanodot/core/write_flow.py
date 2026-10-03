@@ -30,12 +30,17 @@ WATCH_SCOPE = "watch"
 # Activity kinds — the write trail is replayable from the log alone.
 WRITE_PROPOSED = "write-proposed"
 WRITE_APPROVED = "write-approved"  # appended by the CLI, not the runner
+WRITE_AUTO = "write-auto"  # auto mode: a standing grant authorized this payload
+WRITE_SKIPPED = "write-skipped"  # auto mode: no standing grant; nothing sent or asked
 WRITE_INTENT = "write-intent"
 WRITE_DONE = "write-done"
 WRITE_FAILED = "write-failed"
 WRITE_UNKNOWN = "write-unknown"
 
 _RECOVERY_SCAN = (WRITE_INTENT, WRITE_DONE, WRITE_FAILED, WRITE_UNKNOWN)
+# A digest already seen in any of these is never re-authorized: auto writes
+# once per exact content, exactly like the gated re-ask rules.
+_AUTO_SEEN_SCAN = (WRITE_AUTO, WRITE_INTENT, WRITE_DONE, WRITE_FAILED, WRITE_SKIPPED)
 
 
 def draft_failure_comment(task: Task, event: WatchEvent) -> dict:
@@ -76,12 +81,16 @@ class WriteFlow:
     # -- proposing -------------------------------------------------------------
 
     def propose_write(self, task: Task, event: WatchEvent) -> WatchEvent | None:
-        """On a checks-failed event, draft the comment and request approval.
-        A pending or denied request for this exact content is never
-        duplicated or re-asked. Returns the notification event, or None."""
+        """On a checks-failed event, draft the comment and route by mode.
+        Gated: request approval (a pending or denied request for this exact
+        content is never duplicated or re-asked). Auto: a standing grant
+        derives a single-use content-bound capability with no prompt —
+        grant-less content is skipped and recorded once. Readonly: nothing.
+        Returns the notification event, or None."""
         if event.kind != CHECKS_FAILED:
             return None
-        if self._permissions.mode() is not Mode.GATED:
+        mode = self._permissions.mode()
+        if mode is Mode.READONLY:
             return None
         try:
             self._permissions.assert_allowed(COMMENT_ACTION)
@@ -90,25 +99,59 @@ class WriteFlow:
         payload = draft_failure_comment(task, event)
         payload["body"] = self._redactor.scrub(payload["body"])
         digest = payload_digest(payload)
-        prior = self._permissions.has_verbatim_request(task.id, digest)
-        if prior in ("pending", "denied"):
-            return None  # never duplicate a pending ask, never re-ask a denial
         scope_hint = f"{WATCH_SCOPE}:{event.evidence.get('head_sha', '')[:10]}"
-        request = self._permissions.request(
+        if mode is Mode.GATED:
+            prior = self._permissions.has_verbatim_request(task.id, digest)
+            if prior in ("pending", "denied"):
+                return None  # never duplicate a pending ask, never re-ask a denial
+            request = self._permissions.request(
+                action=COMMENT_ACTION,
+                target=str(task.target),
+                scope=scope_hint,
+                task_id=task.id,
+                content=payload,
+            )
+            proposed = WatchEvent(
+                kind=WRITE_PROPOSED,
+                message=(
+                    f"comment proposed on {task.target} — approve with: "
+                    f"nanodot approvals approve {request.id}"
+                ),
+                evidence={
+                    "request_id": request.id,
+                    "action": COMMENT_ACTION,
+                    "target": str(task.target),
+                    "content_hash": digest,
+                    "content": payload["body"],
+                },
+                notable=True,
+                task_id=task.id,
+                at=event.at,
+                occurrence=request.id,
+            )
+            self._append(proposed)
+            return proposed
+        # AUTO — the standing-grant scope is the stable watch scope, so one
+        # pre-grant covers the watch; the payload hash is bound at issue time.
+        if self._auto_seen(task.id, digest):
+            return None
+        capability = self._permissions.authorize_auto(
             action=COMMENT_ACTION,
             target=str(task.target),
-            scope=scope_hint,
+            scope=WATCH_SCOPE,
             task_id=task.id,
-            content=payload,
+            payload=payload,
         )
-        proposed = WatchEvent(
-            kind=WRITE_PROPOSED,
+        if capability is None:
+            return self._record_skip(task, event, digest)
+        authorized = WatchEvent(
+            kind=WRITE_AUTO,
             message=(
-                f"comment proposed on {task.target} — approve with: "
-                f"nanodot approvals approve {request.id}"
+                f"comment auto-authorized on {task.target} by a standing grant "
+                "— it will be sent on this run"
             ),
             evidence={
-                "request_id": request.id,
+                "grant_id": capability.grant_id,
                 "action": COMMENT_ACTION,
                 "target": str(task.target),
                 "content_hash": digest,
@@ -117,10 +160,46 @@ class WriteFlow:
             notable=True,
             task_id=task.id,
             at=event.at,
-            occurrence=request.id,
+            occurrence=capability.grant_id,
         )
-        self._append(proposed)
-        return proposed
+        self._append(authorized)
+        return authorized
+
+    def _auto_seen(self, task_id: str, digest: str) -> bool:
+        """This exact content was already authorized, sent, failed, or
+        skipped: auto never repeats it. A new head SHA drafts new content."""
+        entries = self._activity.query(
+            task_id=task_id, kinds=_AUTO_SEEN_SCAN, limit=500
+        )
+        return any(
+            (entry.evidence or {}).get("content_hash") == digest for entry in entries
+        )
+
+    def _record_skip(
+        self, task: Task, event: WatchEvent, digest: str
+    ) -> WatchEvent | None:
+        """Grant-less auto content: recorded once (never spammed per poll),
+        never prompted, nothing sent. A standing grant added later applies
+        only to content not yet seen."""
+        skipped = WatchEvent(
+            kind=WRITE_SKIPPED,
+            message=(
+                f"comment on {task.target} skipped: no standing grant "
+                f"for {COMMENT_ACTION} — pre-grant with "
+                f"nanodot approvals grant (issue #55)"
+            ),
+            evidence={
+                "action": COMMENT_ACTION,
+                "target": str(task.target),
+                "content_hash": digest,
+            },
+            notable=True,
+            task_id=task.id,
+            at=event.at,
+            occurrence=digest,
+        )
+        self._append(skipped)
+        return skipped
 
     # -- executing ---------------------------------------------------------------
 

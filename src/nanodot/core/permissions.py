@@ -1,15 +1,16 @@
-"""Permissions — ZCode-style (issue #1 review, 2026-09-30; writer port #59).
+"""Permissions — ZCode-style (issue #1 review, 2026-09-30; writer ports #59, #48).
 
-Named modes: `readonly` (the default) and `gated` (writes only through a
-content-bound, single-use capability). Approvals are persisted,
-inspectable, revocable grants scoped to action type + target + scope +
-content hash + expiry; silence is never approval (unanswered requests
-expire and the task stays blocked); denials are recorded; grants are
-invalidated when task scope changes. `auto` remains a rejected
-placeholder. In readonly mode `assert_allowed` denies every external
-write action; in gated mode it admits exactly the implemented write
-actions, and execution still requires a capability that only
-`approve()` — called from the CLI — can issue.
+Named modes with `auto` as the default: `auto` executes writes only against
+pre-granted standing capabilities (a standing grant derives a single-use,
+content-bound capability at run time; a grant-less write is skipped and
+recorded, never prompted), `gated` pauses writes for interactive approval,
+and `readonly` denies every write. Approvals are persisted, inspectable,
+revocable grants scoped to action type + target + scope + content hash +
+expiry; silence is never approval; denials are recorded; grants are
+invalidated when task scope changes. Interactive `approve()` — which can
+issue a capability without a pre-existing standing grant — is called only
+by the CLI; `authorize_auto` additionally requires a standing grant and
+binds the exact payload bytes at issue time (#48 decision 5).
 """
 
 from __future__ import annotations
@@ -36,13 +37,17 @@ class WriteForbidden(PermissionError):
 
 class Mode(str, Enum):
     READONLY = "readonly"
-    GATED = "gated"  # writes pause for approval; the capability is the gate
-    AUTO = "auto"    # designed, dormant: pre-granted scoped capabilities only
+    GATED = "gated"  # writes pause for interactive approval; the capability is the gate
+    AUTO = "auto"    # standing pre-granted capabilities only; never prompts (#48 decision 5)
 
+
+DEFAULT_MODE = Mode.AUTO  # #48 decision 5: pre-granted capabilities only, never prompts
 
 READ_ACTIONS = frozenset({"read"})
-# The one implemented write action (docs/design/github-writer.md §A6).
-GATED_WRITE_ACTIONS = frozenset({"comment"})
+# The implemented write actions (docs/design/github-writer.md §A6).
+WRITE_ACTIONS = frozenset({"comment"})
+# Standing (content-unbound) grants: the AUTO pre-grant marker.
+STANDING_CONTENT_HASH = ""
 
 
 @dataclass(frozen=True)
@@ -168,20 +173,16 @@ class PermissionCenter:
         try:
             configured = Config().get("permission-mode")
             if configured is None:
-                configured = Config().get("mode", Mode.READONLY.value)
+                configured = Config().get("mode", DEFAULT_MODE.value)
             mode = Mode(str(configured))
         except ValueError:
             return Mode.READONLY  # unknown or hand-edited value: fail closed
-        if mode is Mode.AUTO:
-            raise ValueError(
-                "mode 'auto' is not supported; only readonly and gated are available"
-            )
         return mode
 
     def assert_allowed(self, action: str) -> None:
         """The gate every external action must pass. Readonly admits reads
-        only; gated additionally admits exactly the implemented write
-        actions — a grant or capability is still required to execute.
+        only; gated and auto additionally admit exactly the implemented
+        write actions — a grant or capability is still required to execute.
         An unsupported mode denies as WriteForbidden: fail closed."""
         if action in READ_ACTIONS:
             return
@@ -189,7 +190,7 @@ class PermissionCenter:
             mode = self.mode()
         except ValueError as error:
             raise WriteForbidden(str(error)) from error
-        if mode is Mode.GATED and action in GATED_WRITE_ACTIONS:
+        if mode is not Mode.READONLY and action in WRITE_ACTIONS:
             return
         raise WriteForbidden(
             f"action {action!r} is not an available action in the current mode"
@@ -289,6 +290,91 @@ class PermissionCenter:
             target=req.target,
             content_hash=req.content_hash,
             grant_id=grant_id,
+        )
+
+    # -- standing grants (AUTO) -----------------------------------------------
+
+    def create_standing_grant(
+        self,
+        action: str,
+        target: str,
+        scope: str,
+        task_id: str,
+        expires_at: float | None = None,
+    ) -> Grant:
+        """The AUTO pre-grant: authorize an action+target+scope without
+        binding payload bytes (content_hash stays empty). Created only by
+        an explicit CLI act (#55); scope changes revoke it like any grant."""
+        now = self._clock.time()
+        grant = Grant(
+            id=uuid.uuid4().hex[:12],
+            action=action,
+            target=target,
+            scope=scope,
+            task_id=task_id,
+            created_at=now,
+            expires_at=expires_at,
+            revoked_at=None,
+            content_hash=STANDING_CONTENT_HASH,
+        )
+        with self._lock:
+            self._conn.execute(
+                "INSERT INTO grants VALUES (?,?,?,?,?,?,?,?,?)",
+                (
+                    grant.id, grant.action, grant.target, grant.scope,
+                    grant.task_id, grant.created_at, grant.expires_at,
+                    None, grant.content_hash,
+                ),
+            )
+            self._conn.commit()
+        return grant
+
+    def authorize_auto(
+        self,
+        action: str,
+        target: str,
+        scope: str,
+        task_id: str,
+        payload: dict,
+    ) -> WriteCapability | None:
+        """AUTO's execution gate: a standing grant derives a single-use,
+        content-bound capability for THIS exact payload — the payload bytes
+        are hashed at issue time, so every auto write keeps the same
+        audit and replay trail as an interactive approval. Requires auto
+        mode; returns None when no live standing grant matches (the caller
+        skips and records, never prompts)."""
+        if self.mode() is not Mode.AUTO:
+            raise WriteForbidden("authorize_auto requires auto mode")
+        self.assert_allowed(action)
+        digest = payload_digest(payload)
+        now = self._clock.time()
+        with self._lock, self._conn:
+            self._conn.execute("BEGIN IMMEDIATE")
+            standing = self._conn.execute(
+                "SELECT * FROM grants WHERE action=? AND target=? AND scope=? "
+                "AND task_id=? AND content_hash=? AND revoked_at IS NULL "
+                "AND (expires_at IS NULL OR expires_at > ?) LIMIT 1",
+                (action, target, scope, task_id, STANDING_CONTENT_HASH, now),
+            ).fetchone()
+            if standing is None:
+                return None
+            child_id = uuid.uuid4().hex[:12]
+            content = json.dumps(
+                payload, sort_keys=True, separators=(",", ":")
+            )
+            self._conn.execute(
+                "INSERT INTO grants VALUES (?,?,?,?,?,?,?,?,?)",
+                (
+                    child_id, action, target, scope, task_id,
+                    now, standing["expires_at"], None, digest,
+                ),
+            )
+            self._conn.execute(
+                "INSERT INTO capabilities VALUES (?,?,?,?,?,?,NULL)",
+                (child_id, action, target, digest, content, now),
+            )
+        return WriteCapability(
+            action=action, target=target, content_hash=digest, grant_id=child_id,
         )
 
     # -- capabilities --------------------------------------------------------
