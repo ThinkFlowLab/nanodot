@@ -72,6 +72,11 @@ def build_parser() -> argparse.ArgumentParser:
     for action in ("pause", "resume", "cancel"):
         cmd = watch_sub.add_parser(action, help=f"{action} a task")
         cmd.add_argument("task_id")
+    add.add_argument(
+        "--digest", default="off",
+        choices=["off", "6h", "12h", "24h"],
+        help="scheduled status heartbeat: one digest per interval",
+    )
 
     # -- memory ------------------------------------------------------------
     memory = subparsers.add_parser("memory", help="what nanodot retained, and why")
@@ -418,12 +423,14 @@ def _run_watch(args: argparse.Namespace) -> int:
             print(f"error: {redactor.scrub(str(error))}", file=sys.stderr)
             return 1
         try:
+            digest_map = {"off": None, "6h": 21600, "12h": 43200, "24h": 86400}
             task = Task(
                 target=target,
                 purpose=redactor.scrub(purpose),
                 cadence_seconds=args.cadence,
                 notification_conditions=args.notify,
                 stop_conditions=args.stop,
+                digest_interval_seconds=digest_map[args.digest],
                 next_check_at=time.time(),
             )
             task.validate()
@@ -435,6 +442,8 @@ def _run_watch(args: argparse.Namespace) -> int:
         print(f"  target:                 {task.target}")
         print(f"  purpose:                {task.purpose}")
         print(f"  cadence:                every {task.cadence_seconds}s")
+        if task.digest_interval_seconds is not None:
+            print(f"  digest:                 every {task.digest_interval_seconds}s")
         print(f"  allowed actions:        read-only (no external writes)")
         if auth_mode == "anonymous":
             print("  GitHub access:          anonymous (public repositories only)")
@@ -497,6 +506,8 @@ def _run_watch(args: argparse.Namespace) -> int:
     print(f"  target:                 {task.target}")
     print(f"  purpose:                {task.purpose}")
     print(f"  cadence:                every {task.cadence_seconds}s")
+    if task.digest_interval_seconds is not None:
+        print(f"  digest:                 every {task.digest_interval_seconds}s")
     print(f"  allowed actions:        read-only")
     print(f"  notification conditions:{task.notification_conditions}")
     print(f"  stop conditions:        {task.stop_conditions}")

@@ -47,6 +47,8 @@ SUPPORTED_STOP_CONDITIONS = frozenset(
         "required checks pass on the current head SHA, or the PR merges or closes",
     }
 )
+# Digest windows (issue #80): a fixed enum, never a free-form interval.
+SUPPORTED_DIGEST_INTERVALS = frozenset({21600, 43200, 86400})  # 6h/12h/24h
 
 
 class TaskError(ValueError):
@@ -99,6 +101,7 @@ class Task:
     created_at: float = field(default_factory=time.time)
     updated_at: float = field(default_factory=time.time)
     next_check_at: float | None = None
+    digest_interval_seconds: int | None = None  # None = no scheduled digest
     watch_state: dict = field(default_factory=dict)
     id: str = field(default_factory=lambda: uuid.uuid4().hex[:12])
 
@@ -124,6 +127,13 @@ class Task:
                 "unsupported stop conditions; the MVP only supports: "
                 + DEFAULT_STOP_CONDITIONS
             )
+        if self.digest_interval_seconds is not None and (
+            self.digest_interval_seconds not in SUPPORTED_DIGEST_INTERVALS
+        ):
+            raise TaskError(
+                "digest interval must be one of: 21600 (6h), 43200 (12h), "
+                "86400 (24h), or omitted"
+            )
 
 
 _SCHEMA = """
@@ -141,6 +151,7 @@ CREATE TABLE IF NOT EXISTS tasks (
   created_at REAL NOT NULL,
   updated_at REAL NOT NULL,
   next_check_at REAL,
+  digest_interval_seconds INTEGER,
   watch_state TEXT NOT NULL DEFAULT '{}'
 );
 """
@@ -164,7 +175,18 @@ class TaskStore:
         self._conn.row_factory = sqlite3.Row
         with self._lock:
             self._conn.executescript(_SCHEMA)
+            self._ensure_digest_column()
             self._conn.commit()
+
+    def _ensure_digest_column(self) -> None:
+        """Additive migration (legacy rows keep NULL = digest off)."""
+        columns = {
+            row["name"] for row in self._conn.execute("PRAGMA table_info(tasks)")
+        }
+        if "digest_interval_seconds" not in columns:
+            self._conn.execute(
+                "ALTER TABLE tasks ADD COLUMN digest_interval_seconds INTEGER"
+            )
 
     # -- mapping helpers -------------------------------------------------
 
@@ -189,6 +211,7 @@ class TaskStore:
             created_at=row["created_at"],
             updated_at=row["updated_at"],
             next_check_at=row["next_check_at"],
+            digest_interval_seconds=row["digest_interval_seconds"],
             watch_state=json.loads(row["watch_state"]),
         )
 
@@ -207,6 +230,7 @@ class TaskStore:
             task.created_at,
             task.updated_at,
             task.next_check_at,
+            task.digest_interval_seconds,
             json.dumps(task.watch_state),
         )
 
@@ -227,7 +251,7 @@ class TaskStore:
         try:
             with self._lock, self._conn:
                 self._conn.execute(
-                    "INSERT INTO tasks VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    "INSERT INTO tasks VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                     self._task_to_values(task),
                 )
         except sqlite3.IntegrityError as error:
@@ -295,7 +319,7 @@ class TaskStore:
                 "UPDATE tasks SET target=?, purpose=?, cadence_seconds=?, "
                 "allowed_actions=?, notification_conditions=?, stop_conditions=?, "
                 "state=?, blocker=?, scope_version=?, created_at=?, updated_at=?, "
-                "next_check_at=?, watch_state=? WHERE id=?",
+                "next_check_at=?, digest_interval_seconds=?, watch_state=? WHERE id=?",
                 self._task_to_values(task)[1:] + (task.id,),
             )
         return task
