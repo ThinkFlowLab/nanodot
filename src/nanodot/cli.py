@@ -176,10 +176,13 @@ def _wiring(teardown: Teardown | None = None) -> tuple:
     center = PermissionCenter()
     own("permission-center", center.close)
     if center.mode() in (Mode.GATED, Mode.AUTO):
+        from nanodot.core.quota import WriteQuota
         from nanodot.native.github_writer import GitHubWriter
 
+        quota = WriteQuota(activity=activity)
+        own("write-quota", quota.close)
         write = WriteFlow(
-            center, GitHubWriter(), activity, redactor=redactor,
+            center, GitHubWriter(), activity, redactor=redactor, quota=quota,
         )
     loop = TaskLoop(
         store, fetcher, sink, activity,
