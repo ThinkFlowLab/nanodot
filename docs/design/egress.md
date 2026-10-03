@@ -1,7 +1,7 @@
 # Egress — exactly what leaves the host
 
 Nanodot is local-first: task state, memory, the activity log, and the inbox
-live in `~/.nanodot` and never leave the machine. Two things leave, and
+live in `~/.nanodot` and never leave the machine. Three things leave, and
 only through their ports:
 
 ## 1. GitHub reads (the snapshot port)
@@ -14,7 +14,7 @@ only through their ports:
 - **Credential:** the read-only PAT travels in the `Authorization` header
   and exists nowhere else outside the secret store.
 
-## 2. Inference (the provider port) — the only other egress point
+## 2. Inference (the provider port)
 
 Requests are built by `core.egress.EgressGuard` from a fixed whitelist;
 there is structurally no way to attach anything else:
@@ -34,12 +34,20 @@ provider; the API key travels only in the `Authorization` header. A local
 model behind the same interface removes this egress entirely — no other
 code changes.
 
-## 3. GitHub writes (the writer port, gated mode)
+## 3. GitHub writes (the writer port)
 
-Only in gated mode, and only behind a content-bound, single-use
-capability issued by a human approval (`nanodot approvals approve`):
+Only in a write mode (`gated` or `auto`), only behind a content-bound,
+single-use capability — issued by a human approval
+(`nanodot approvals approve`) in gated mode, or derived from a standing
+pre-grant in auto mode — and only while the write quota for
+(action, watch, day) is not exhausted:
 
 - **Destination:** `api.github.com` (a comment POST on the watched PR).
+- **Construction invariant:** a write request exists only with a live
+  grant id + whitelisted rule-drafted evidence + remaining quota; anything
+  missing and no transport is constructed at all. An unanswered ask
+  expires after 4 hours (silence is never approval; a second silence is a
+  terminal denial).
 - **Content:** exactly the approved payload bytes — the native writer
   verifies the capability's SHA-256 against the body before sending;
   a mismatch sends nothing.

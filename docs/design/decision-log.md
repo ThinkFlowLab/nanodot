@@ -17,6 +17,16 @@ Decisions are deterministic given `(task, snapshot, clock)`, so the log alone
 replays every stop/notify decision without re-asking GitHub — auditability as
 the runtime extension of "substitution is the proof" (adapter-seam.md).
 
+Write decisions join the same guarantee (issues #54–#56): every write is a
+replayable trail — `write-proposed` (the ask, with content hash and body),
+`write-approved` (the CLI's approval), `write-intent` (durable before the
+POST), then `write-done` / `write-failed` / `write-unknown`; budget
+exhaustion records `quota-exhausted` once per action/watch/day, and a
+second unanswered ask records `write-silence-denied`. The bytes at the HTTP
+boundary hash-equal the approved content hash by construction, so the log
+plus the permission tables reconstruct every write decision offline:
+what was asked, who approved it, what was sent, and what refused to leave.
+
 ## Guarantees and boundaries
 
 - A run overtaken by pause/cancel/scope change records nothing that the

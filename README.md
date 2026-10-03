@@ -148,6 +148,12 @@ explicit hard-off — no writes are even proposed. All write modes require a sep
 (`nanodot config set github-write-token`); the read token never gains
 write reach, and without a write token every mode is inert.
 
+Writes are also bounded by a hard daily budget per watch — by default
+3 comments, 3 labels, and 1 review approval per day (the comment action
+is the first shipped). Exhaustion is recorded once in the activity log
+and the action is simply not attempted again until the next day; it is
+never an error for the watch loop.
+
 ### Fixed watch policy
 
 This MVP supports a fixed, validated policy. It notifies on new commits, check
