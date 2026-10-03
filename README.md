@@ -143,8 +143,10 @@ grant-less content is skipped and recorded once, nothing sent, nothing
 asked. `gated` pauses every write as a proposal in the inbox until you
 run `nanodot approvals approve <request-id>`; a proposal nobody answers
 expires in 4 hours, is re-asked at most once, and a second silence is
-recorded as a denial — never re-asked verbatim. `readonly` is the
-explicit hard-off — no writes are even proposed. All write modes require a separate write token
+recorded as a denial — never re-asked verbatim. Write volume is hard-capped
+per watch per day (default 3 comments; exhaustion degrades fail-closed and
+never disturbs the watch loop). `readonly` is the explicit hard-off — no
+writes are even proposed. All write modes require a separate write token
 (`nanodot config set github-write-token`); the read token never gains
 write reach, and without a write token every mode is inert.
 

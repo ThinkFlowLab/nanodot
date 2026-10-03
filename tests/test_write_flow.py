@@ -34,12 +34,14 @@ from nanodot.core.write_flow import (
     WRITE_FAILED,
     WRITE_INTENT,
     WRITE_PROPOSED,
+    WRITE_QUOTA_EXHAUSTED,
     WRITE_SILENCE_DENIED,
     WRITE_SKIPPED,
     WRITE_UNKNOWN,
     WriteFlow,
 )
 from nanodot.core.tasks import PRTarget, Task, TaskStore
+from nanodot.core.write_quota import WriteQuota
 from nanodot.native.github_client import GitHubSnapshotFetcher
 from nanodot.native.secrets_file import FileSecretStore
 from nanodot.ports.github_writer import (
@@ -78,10 +80,11 @@ class Harness:
         self.store = TaskStore(path=home / "nanodot.db", redactor=self.redactor)
         self.activity = ActivityLog(path=home / "nanodot.db", redactor=self.redactor)
         self.permissions = PermissionCenter(path=home / "nanodot.db", clock=self.clock)
+        self.quota = WriteQuota(path=home / "nanodot.db", clock=self.clock)
         self.writer = FakeWriter()
         self.write = WriteFlow(
             self.permissions, self.writer, self.activity,
-            redactor=self.redactor,
+            redactor=self.redactor, quota=self.quota,
         )
         self.github = FakeGitHub(TARGET)
         self.github.set_pr("open", head_sha="s1")
@@ -116,9 +119,11 @@ class Harness:
         h.store = TaskStore(path=self.home / "nanodot.db", redactor=h.redactor)
         h.activity = ActivityLog(path=self.home / "nanodot.db", redactor=h.redactor)
         h.permissions = PermissionCenter(path=self.home / "nanodot.db", clock=self.clock)
+        h.quota = WriteQuota(path=self.home / "nanodot.db", clock=self.clock)
         h.writer = FakeWriter()
         h.write = WriteFlow(
             h.permissions, h.writer, h.activity, redactor=h.redactor,
+            quota=h.quota,
         )
         h.github = self.github
         h.sink = FakeSink()
@@ -306,6 +311,53 @@ def test_expired_ask_is_reasked_once_then_denied_by_silence(home: Path) -> None:
     # A third identical ask produces nothing, ever.
     assert h.write.propose_write(h.task, event) is None
     assert h.kinds().count(WRITE_SILENCE_DENIED) == 1
+
+
+def test_auto_quota_bounds_distinct_writes_per_day(home: Path) -> None:
+    h = Harness(home, gated=False)
+    h.permissions.create_standing_grant(
+        action="comment", target=str(TARGET), scope="watch", task_id=h.task.id
+    )
+    h.quota.set_budget(h.task.id, "comment", 1)
+
+    h.clock.advance(300)
+    h.tick()  # s1: authorized within budget...
+    h.clock.advance(300)
+    h.tick()  # ...and sent (charged at send time)
+    assert len(h.writer.sends) == 1
+
+    # New content (new head) while the day's budget is spent: recorded
+    # once, never sent, the watch keeps running.
+    h.github.set_pr("open", head_sha="s2")
+    h.github.add_check("ci", FAILURE, sha="s2")
+    h.clock.advance(300)
+    outcome = h.tick()
+    assert outcome is RunOutcome.OK
+    assert h.kinds().count(WRITE_QUOTA_EXHAUSTED) == 1
+    assert len(h.writer.sends) == 1
+    assert h.store.get(h.task.id).state.value == "active"
+
+    # Exhausted content is not retried (its event was already delivered);
+    # the next UTC day the budget returns for NEW failing content.
+    h.github.set_pr("open", head_sha="s3")
+    h.github.add_check("ci", FAILURE, sha="s3")
+    h.clock.advance(24 * 3600)
+    h.tick()
+    h.clock.advance(300)
+    h.tick()
+    assert len(h.writer.sends) == 2
+    assert h.kinds().count(WRITE_QUOTA_EXHAUSTED) == 1  # recorded once, ever
+
+
+def test_gated_quota_blocks_request_creation_fail_closed(home: Path) -> None:
+    h = Harness(home)
+    h.quota.set_budget(h.task.id, "comment", 0)
+    outcome = h.tick()
+    assert outcome is RunOutcome.OK
+    assert h.permissions.pending() == []  # not even a request was created
+    assert h.kinds().count(WRITE_QUOTA_EXHAUSTED) == 1
+    assert h.writer.sends == []
+    assert h.store.get(h.task.id).state.value == "active"
 
 
 # -- 5. single use ----------------------------------------------------------------

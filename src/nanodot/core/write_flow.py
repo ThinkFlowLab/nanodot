@@ -20,6 +20,7 @@ from nanodot.core.permissions import (
 from nanodot.core.redaction import Redactor
 from nanodot.core.statemachine import CHECKS_FAILED, WatchEvent
 from nanodot.core.tasks import Task
+from nanodot.core.write_quota import WriteQuota
 from nanodot.ports.github_writer import (
     GitHubWriter,
     WriteCapability,
@@ -37,6 +38,7 @@ WRITE_APPROVED = "write-approved"  # appended by the CLI, not the runner
 WRITE_AUTO = "write-auto"  # auto mode: a standing grant authorized this payload
 WRITE_SKIPPED = "write-skipped"  # auto mode: no standing grant; nothing sent or asked
 WRITE_SILENCE_DENIED = "write-silence-denied"  # two expired asks; terminal (#48 decision 3)
+WRITE_QUOTA_EXHAUSTED = "quota-exhausted"  # the day's write budget is spent; fail-closed
 WRITE_INTENT = "write-intent"
 WRITE_DONE = "write-done"
 WRITE_FAILED = "write-failed"
@@ -74,10 +76,12 @@ class WriteFlow:
         writer: GitHubWriter,
         activity: ActivityLog,
         redactor: Redactor | None = None,
+        quota: WriteQuota | None = None,
     ) -> None:
         self._permissions = permissions
         self._writer = writer
         self._activity = activity
+        self._quota = quota
         # The requests table is a persistence boundary: content is scrubbed
         # before it is hashed and stored, so what was approved, what is
         # logged, and what is sent are the same secret-free bytes.
@@ -106,6 +110,10 @@ class WriteFlow:
         digest = payload_digest(payload)
         scope_hint = f"{WATCH_SCOPE}:{event.evidence.get('head_sha', '')[:10]}"
         if mode is Mode.GATED:
+            if self._quota is not None and self._quota.remaining(
+                COMMENT_ACTION, task.id, event.at
+            ) <= 0:
+                return self._record_quota_exhausted(task, event, digest)
             states = self._permissions.verbatim_request_states(task.id, digest)
             state_names = [state for state, _ in states]
             if "pending" in state_names or "denied" in state_names:
@@ -163,6 +171,10 @@ class WriteFlow:
             return proposed
         # AUTO — the standing-grant scope is the stable watch scope, so one
         # pre-grant covers the watch; the payload hash is bound at issue time.
+        if self._quota is not None and self._quota.remaining(
+            COMMENT_ACTION, task.id, event.at
+        ) <= 0:
+            return self._record_quota_exhausted(task, event, digest)
         if self._auto_seen(task.id, digest):
             return None
         capability = self._permissions.authorize_auto(
@@ -200,6 +212,63 @@ class WriteFlow:
         skipped: auto never repeats it. A new head SHA drafts new content."""
         entries = self._activity.query(
             task_id=task_id, kinds=_AUTO_SEEN_SCAN, limit=500
+        )
+        return any(
+            (entry.evidence or {}).get("content_hash") == digest for entry in entries
+        )
+
+    def _quota_exhausted_event(
+        self, task: Task, capability: WriteCapability, now: float
+    ) -> WatchEvent:
+        return WatchEvent(
+            kind=WRITE_QUOTA_EXHAUSTED,
+            message=(
+                f"comment on {task.target} not sent: the daily write budget "
+                "is exhausted; the watch continues and later failures get "
+                "the next day's budget"
+            ),
+            evidence={
+                "action": capability.action,
+                "target": str(task.target),
+                "content_hash": capability.content_hash,
+            },
+            notable=True,
+            task_id=task.id,
+            at=now,
+            occurrence=capability.content_hash,
+        )
+
+    def _record_quota_exhausted(
+        self, task: Task, event: WatchEvent, digest: str
+    ) -> WatchEvent | None:
+        """Checked before any request creation: an exhausted budget stops
+        the action for the day, recorded once per content, never an error
+        for the run (#48 decision 4)."""
+        if self._quota_seen(task.id, digest):
+            return None
+        exhausted = WatchEvent(
+            kind=WRITE_QUOTA_EXHAUSTED,
+            message=(
+                f"comment on {task.target} skipped: the daily write budget "
+                "is exhausted; the watch continues and later failures get "
+                "the next day's budget"
+            ),
+            evidence={
+                "action": COMMENT_ACTION,
+                "target": str(task.target),
+                "content_hash": digest,
+            },
+            notable=True,
+            task_id=task.id,
+            at=event.at,
+            occurrence=digest,
+        )
+        self._append(exhausted)
+        return exhausted
+
+    def _quota_seen(self, task_id: str, digest: str) -> bool:
+        entries = self._activity.query(
+            task_id=task_id, kinds=(WRITE_QUOTA_EXHAUSTED,), limit=500
         )
         return any(
             (entry.evidence or {}).get("content_hash") == digest for entry in entries
@@ -252,6 +321,16 @@ class WriteFlow:
             # the store actually issued (and no one has used) is sendable.
             if not self._permissions.consume(capability.grant_id):
                 continue  # forged, lost the race, or replayed: never send
+            if self._quota is not None and not self._quota.try_charge(
+                capability.action, task.id, capability.content_hash, now
+            ):
+                # The budget was spent between proposal and send: the
+                # capability is consumed (it can never be sent later) and
+                # the day's attempt stops here — fail closed.
+                events.append(
+                    self._quota_exhausted_event(task, capability, now)
+                )
+                continue
             if not self._log_intent(task, capability, now):
                 continue  # no durable intent, no send — fail closed
             if superseded is not None and superseded():

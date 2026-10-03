@@ -269,7 +269,9 @@ otherwise the write is skipped and recorded once in the inbox. `gated`
 mode (`nanodot config set permission-mode gated`) pauses every write as a
 proposal until you approve it; an unanswered proposal expires after 4
 hours, is re-asked at most once, and a second silence is recorded as a
-denial. `readonly` (`nanodot config set permission-mode readonly`)
+denial. Write volume is capped per watch per day (3 comments by default;
+when the budget is spent the write is skipped and recorded, and the watch
+keeps running). `readonly` (`nanodot config set permission-mode readonly`)
 proposes and sends nothing. All writes additionally require
 `nanodot config set github-write-token`.
 

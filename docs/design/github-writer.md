@@ -85,8 +85,10 @@ replayable trail as an interactive approval. The standing grant survives
   standing grant and hashes the payload at issue time.
 - Compensating controls for the missing human look: deterministic
   rule-drafted payloads, redaction before hashing, single-use
-  capabilities, the write token's fine-grained scope, and — landing with
-  #53 — the hard per-action/watch/day quota as the bound on volume.
+  capabilities, the write token's fine-grained scope, and the hard
+  per-action/watch/day quota (#53: `core/write_quota.py`, default 3/3/1,
+  charged once per exact content at send time, fail-closed exhaustion) as
+  the bound on volume.
 - `readonly` stays the explicit hard-off; a fresh install has no write
   token and no grants, so the default AUTO mode is inert until the user
   acts.
