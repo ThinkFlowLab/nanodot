@@ -13,6 +13,7 @@
 const { spawn } = require('node:child_process');
 
 const DEFAULT_TIMEOUT_MS = 120000;
+const DEFAULT_KILL_GRACE_MS = 5000;
 const MAX_OUTPUT_CHARS = 8000;
 
 class NanodotToolError extends Error {
@@ -144,7 +145,7 @@ function tail(text, limit) {
   return `…${text.slice(-limit)}`;
 }
 
-function runNanodot(argv, { binary, signal, timeoutMs, env }) {
+function runNanodot(argv, { binary, signal, timeoutMs, killGraceMs, env }) {
   const executable = binary || process.env.NANODOT_BIN || 'nanodot';
   return new Promise((resolve, reject) => {
     let settled = false;
@@ -157,27 +158,22 @@ function runNanodot(argv, { binary, signal, timeoutMs, env }) {
     child.stdout.on('data', (chunk) => { stdout += chunk; });
     child.stderr.on('data', (chunk) => { stderr += chunk; });
 
-    const timer = setTimeout(() => {
-      if (!settled) child.kill('SIGTERM');
-    }, timeoutMs || DEFAULT_TIMEOUT_MS);
-
-    const onAbort = () => child.kill('SIGTERM');
-    if (signal) {
-      if (signal.aborted) onAbort();
-      else signal.addEventListener('abort', onAbort, { once: true });
-    }
-
+    let graceTimer = null;
     const finish = (code, signalName) => {
       if (settled) return;
       settled = true;
       clearTimeout(timer);
+      clearTimeout(graceTimer);
       if (signal) signal.removeEventListener('abort', onAbort);
-      if (signalName === 'SIGTERM' && code === null) {
+      if (code === null && (signalName === 'SIGTERM' || signalName === 'SIGKILL')) {
         reject(new NanodotToolError('NANODOT_TERMINATED', 'the call was cancelled or timed out'));
         return;
       }
       if (code === 0) {
-        resolve(stdout.trim() || '(no output)');
+        // Success output is capped too: an activity timeline can be far
+        // larger than any model context. nanodot prints oldest-first with
+        // the newest last, so the tail keeps what matters.
+        resolve(tail(stdout.trim() || '(no output)', MAX_OUTPUT_CHARS));
         return;
       }
       // Nonzero exit is a typed outcome, not prose: the code is the identity,
@@ -185,10 +181,30 @@ function runNanodot(argv, { binary, signal, timeoutMs, env }) {
       const detail = tail((stderr || stdout).trim(), 2000) || 'no diagnostics';
       reject(new NanodotToolError(`NANODOT_EXIT_${code ?? 'UNKNOWN'}`, detail));
     };
+
+    // Termination is two-stage: SIGTERM first (the CLI shuts down
+    // cooperatively), then SIGKILL — a process that ignores SIGTERM must
+    // not hang the tool forever.
+    const terminate = () => {
+      if (settled) return;
+      child.kill('SIGTERM');
+      graceTimer = setTimeout(() => {
+        if (!settled) child.kill('SIGKILL');
+      }, killGraceMs || DEFAULT_KILL_GRACE_MS);
+    };
+    const timer = setTimeout(terminate, timeoutMs || DEFAULT_TIMEOUT_MS);
+
+    const onAbort = () => terminate();
+    if (signal) {
+      if (signal.aborted) terminate();
+      else signal.addEventListener('abort', onAbort, { once: true });
+    }
+
     child.on('error', (error) => {
       if (settled) return;
       settled = true;
       clearTimeout(timer);
+      clearTimeout(graceTimer);
       if (signal) signal.removeEventListener('abort', onAbort);
       reject(new NanodotToolError('NANODOT_SPAWN_FAILED', error.message));
     });

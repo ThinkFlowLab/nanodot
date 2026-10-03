@@ -25,6 +25,10 @@ function fixture(t) {
     `  JSON.stringify({ argv, home: process.env.NANODOT_HOME }) + '\\n');`,
     `if (argv.includes('--fail')) { console.error('boom from stderr'); process.exit(7); }`,
     `else if (argv.includes('--hang')) { setInterval(() => {}, 1000); }`,
+    `else if (argv.includes('--stubborn')) {`,
+    `  process.on('SIGTERM', () => {}); setInterval(() => {}, 1000);`,
+    `}`,
+    `else if (argv.includes('--chatty')) { console.log('x'.repeat(20000)); }`,
     `else { console.log('fake nanodot output'); }`,
   ].join('\n'), { mode: 0o755 });
   const calls = () => fs.readFileSync(path.join(root, 'calls.jsonl'), 'utf8')
@@ -133,4 +137,24 @@ test('a missing binary is a spawn failure, not a hang', async t => {
     runTool('nanodot_status', {}, { binary: '/nonexistent/nanodot', timeoutMs: 2000 }),
     (error) => error.code === 'NANODOT_SPAWN_FAILED',
   );
+});
+
+test('successful output is capped — a huge timeline cannot flood the model', async t => {
+  const f = fixture(t);
+  const output = await runTool('nanodot_watch_add', { target: '--chatty' }, { binary: f.bin });
+  assert.ok(output.startsWith('…'), 'truncated output is marked');
+  assert.ok(output.length <= 8001, `output was ${output.length} chars`);
+  assert.ok(output.endsWith('xxxx'));
+});
+
+test('a SIGTERM-ignoring child is SIGKILLed after the grace period', async t => {
+  const f = fixture(t);
+  const started = Date.now();
+  await assert.rejects(
+    runTool('nanodot_watch_add', { target: '--stubborn' },
+      { binary: f.bin, timeoutMs: 150, killGraceMs: 300 }),
+    (error) => error.code === 'NANODOT_TERMINATED',
+  );
+  const elapsed = Date.now() - started;
+  assert.ok(elapsed < 5000, `escalation took ${elapsed}ms`);
 });

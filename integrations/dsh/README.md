@@ -36,6 +36,11 @@ failures, access blockers, and terminal outcomes. Names are byte-stable
   `NANODOT_MISSING_PARAMETER`, `NANODOT_BAD_PARAMETER`, `NANODOT_SPAWN_FAILED`,
   `NANODOT_TERMINATED`, `NANODOT_EXIT_<code>`. Bounded stderr travels as
   diagnostic data, never as the error identity.
+- **Output is bounded in both directions**: successful output is capped
+  (keeping the tail — nanodot prints oldest-first) so a long activity
+  timeline cannot flood the model context, and termination is two-stage
+  (SIGTERM, then SIGKILL after a grace period) so a stuck child cannot hang
+  the tool.
 
 ## Mounting (per the DSH v0.1 guide)
 
