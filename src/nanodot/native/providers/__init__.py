@@ -29,26 +29,44 @@ PROVIDER_CONFIG_PREFIX = "provider."
 
 def _openai_compat_factory(
     api_key: str, base_url: str, model: str, timeout: float,
-    redactor: Redactor,
+    redactor: Redactor, name: str = "openai-compat",
+    usage=None, daily_limit: int | None = None,
 ) -> InferenceProvider:
     from nanodot.native.providers.openai_compat import APIInferenceProvider
 
     return APIInferenceProvider(
         api_key=api_key, base_url=base_url, model=model,
-        redactor=redactor, timeout=timeout,
+        redactor=redactor, timeout=timeout, name=name,
+        usage=usage, daily_limit=daily_limit,
     )
 
 
 def _anthropic_factory(
     api_key: str, base_url: str, model: str, timeout: float,
-    redactor: Redactor,
+    redactor: Redactor, name: str = "anthropic",
+    usage=None, daily_limit: int | None = None,
 ) -> InferenceProvider:
     from nanodot.native.providers.anthropic import AnthropicProvider
 
     return AnthropicProvider(
         api_key=api_key, base_url=base_url, model=model,
-        redactor=redactor, timeout=timeout,
+        redactor=redactor, timeout=timeout, name=name,
+        usage=usage, daily_limit=daily_limit,
     )
+
+
+_usage_store = None
+
+
+def shared_usage_store():
+    """One process-wide usage store; memoized so repeated
+    configured_provider() calls do not pile up connections."""
+    global _usage_store
+    if _usage_store is None:
+        from nanodot.core.model_usage import ModelUsage
+
+        _usage_store = ModelUsage()
+    return _usage_store
 
 
 # name -> (factory, preset base URL)
@@ -134,7 +152,10 @@ def configured_provider() -> InferenceProvider | None:
         base_url = _validate_base_url(str(base_url))
     except ValueError as error:
         return _MisconfiguredProvider(str(error))
+    limit = config.get("model-daily-limit")
     return factory(
         api_key=api_key, base_url=base_url, model=str(model),
-        timeout=timeout, redactor=Redactor(secrets),
+        timeout=timeout, redactor=Redactor(secrets), name=name,
+        usage=shared_usage_store(),
+        daily_limit=int(limit) if limit is not None else None,
     )

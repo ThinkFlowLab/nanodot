@@ -93,6 +93,11 @@ def build_parser() -> argparse.ArgumentParser:
     m_rm = memory_sub.add_parser("rm", help="delete an item")
     m_rm.add_argument("item_id")
 
+    # -- model ----------------------------------------------------------------
+    model = subparsers.add_parser("model", help="the optional model provider")
+    model_sub = model.add_subparsers(dest="model_command", required=True)
+    model_sub.add_parser("usage", help="per-provider call and token usage")
+
     # -- approvals -----------------------------------------------------------
     approvals = subparsers.add_parser("approvals", help="pending requests and grants")
     approvals_sub = approvals.add_subparsers(dest="approvals_command")
@@ -568,6 +573,30 @@ def _print_memory_item(item) -> None:
     )
 
 
+def _run_model_usage(_: argparse.Namespace) -> int:
+    from nanodot.core.config import Config
+    from nanodot.native.providers import shared_usage_store
+
+    limit = Config().get("model-daily-limit")
+    suffix = (
+        f"  (model-daily-limit: {limit})"
+        if limit is not None
+        else "  (no daily limit)"
+    )
+    rows = shared_usage_store().summary()
+    print(f"model usage{suffix}")
+    if not rows:
+        print("  no calls recorded")
+        return 0
+    for row in rows:
+        print(
+            f"  {row['day']}  {row['provider']:<12} "
+            f"calls={row['calls']}  tokens={row['input_tokens']} in / "
+            f"{row['output_tokens']} out"
+        )
+    return 0
+
+
 def _run_approvals(args: argparse.Namespace) -> int:
     from nanodot.core.activity import ActivityLog
     from nanodot.core.permissions import PermissionCenter
@@ -911,6 +940,9 @@ def main(argv: list[str] | None = None) -> int:
         return _run_watch(args)
     if args.command == "memory":
         return _run_memory(args)
+    if args.command == "model":
+        if args.model_command == "usage":
+            return _run_model_usage(args)
     if args.command == "approvals":
         return _run_approvals(args)
     if args.command == "activity":

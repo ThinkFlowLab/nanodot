@@ -51,6 +51,9 @@ class AnthropicProvider(InferenceProvider):
         model: str = "claude-sonnet-4-5",
         redactor: Redactor | None = None,
         timeout: float = DEFAULT_REQUEST_TIMEOUT,
+        name: str = "anthropic",
+        usage=None,
+        daily_limit: int | None = None,
     ) -> None:
         if timeout <= 0:
             raise ValueError("provider timeout must be positive")
@@ -60,12 +63,18 @@ class AnthropicProvider(InferenceProvider):
         self._model = model
         self._redactor = redactor
         self._guard = EgressGuard(scrubber=self._scrub)
+        self._name = name
+        self._usage = usage
+        self._daily_limit = daily_limit
 
     def _scrub(self, text: str) -> str:
         text = self._redactor.scrub(text) if self._redactor else text
         return text.replace(self._api_key, "***") if self._api_key else text
 
     def _messages(self, system: str, user: str) -> str:
+        from nanodot.native.providers.openai_compat import _budget_check
+
+        _budget_check(self._name, self._usage, self._daily_limit)
         body = json.dumps(
             {
                 "model": self._scrub(self._model),
@@ -87,6 +96,18 @@ class AnthropicProvider(InferenceProvider):
             )
             with authenticated_urlopen(request, timeout=self._timeout) as response:
                 payload = json.loads(response.read().decode())
+            usage_block = payload.get("usage") or {}
+            if self._usage is not None and usage_block:
+                from nanodot.native.providers.openai_compat import _tokens_of
+
+                input_tokens, output_tokens = _tokens_of(
+                    usage_block, "input_tokens", "output_tokens"
+                )
+                self._usage.record(
+                    self._name,
+                    input_tokens=input_tokens,
+                    output_tokens=output_tokens,
+                )
         except urllib.error.HTTPError as error:
             detail = self._scrub(error.read().decode(errors="replace"))[:200]
             raise ProviderError(

@@ -29,6 +29,18 @@ MODE_KEYS = ("permission-mode", "mode")  # canonical name first; mode is legacy
 def _validated_value(key: str, value: object) -> object:
     if key == "github-auth-mode" and value not in ("token", "anonymous"):
         raise ValueError("github-auth-mode must be token or anonymous")
+    if key == "model-daily-limit":
+        if isinstance(value, str) and value.isdigit():
+            return int(value)
+        if type(value) is int and value >= 0:
+            return value
+        raise ValueError("model-daily-limit must be a nonnegative integer")
+    if key == "model-daily-limit":
+        if isinstance(value, str) and value.isdigit():
+            return int(value)
+        if type(value) is int and value >= 0:
+            return value
+        raise ValueError("model-daily-limit must be a nonnegative integer")
     if key == "os-notifications":
         if type(value) is bool:
             return value
