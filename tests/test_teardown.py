@@ -53,6 +53,23 @@ def test_teardown_runs_every_step_and_names_only_the_failures() -> None:
     assert order == ["third", "second", "first"]  # every step ran, in reverse
 
 
+def test_teardown_survives_base_exception_in_a_disposer() -> None:
+    """A second Ctrl-C landing mid-unwind costs one step, not the rest."""
+    order: list[str] = []
+    teardown = Teardown()
+
+    def interrupted() -> None:
+        order.append("second")
+        raise KeyboardInterrupt
+
+    teardown.register("first", lambda: order.append("first"))
+    teardown.register("second", interrupted)
+    teardown.register("third", lambda: order.append("third"))
+
+    assert teardown.run() == ["second"]
+    assert order == ["third", "second", "first"]  # 'first' still ran
+
+
 # -- TaskLoop.close: drain the summary, drop the locks -----------------------
 
 
@@ -137,10 +154,39 @@ def test_runner_once_unwinds_every_registration_in_reverse(
     monkeypatch.setattr(TaskStore, "close", lambda self: order.append("task-store"))
     monkeypatch.setattr(ActivityLog, "close", lambda self: order.append("activity-log"))
     monkeypatch.setattr(MemoryStore, "close", lambda self: order.append("memory-store"))
+    from nanodot.native.notifier import NativeNotifier
+
+    monkeypatch.setattr(NativeNotifier, "close", lambda self: order.append("inbox-sink"))
     monkeypatch.setattr(TaskLoop, "close", lambda self: order.append("task-loop"))
 
     assert main(["runner", "--once"]) == 0
-    assert order == ["task-loop", "memory-store", "activity-log", "task-store"]
+    assert order == ["task-loop", "inbox-sink", "memory-store", "activity-log", "task-store"]
+
+
+def test_wiring_failure_still_unwinds_registered_resources(
+    home: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A wiring step that fails after stores opened must not leak them."""
+    order: list[str] = []
+    monkeypatch.setattr(TaskStore, "close", lambda self: order.append("task-store"))
+    monkeypatch.setattr(ActivityLog, "close", lambda self: order.append("activity-log"))
+    monkeypatch.setattr(MemoryStore, "close", lambda self: order.append("memory-store"))
+    from nanodot.native.notifier import NativeNotifier
+
+    monkeypatch.setattr(NativeNotifier, "close", lambda self: order.append("inbox-sink"))
+
+    def broken_provider():
+        raise ValueError("secrets file unusable")
+
+    # _wiring imports configured_provider locally at call time; patch the
+    # source module so the failure lands mid-wiring, after the stores open.
+    monkeypatch.setattr(
+        "nanodot.native.inference_api.configured_provider", broken_provider
+    )
+
+    assert main(["runner", "--once"]) == 1
+    assert "error:" in capsys.readouterr().err
+    assert order == ["inbox-sink", "memory-store", "activity-log", "task-store"]
 
 
 def test_runner_once_disposes_cleanly_and_leaves_readable_data(

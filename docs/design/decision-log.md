@@ -19,11 +19,19 @@ the runtime extension of "substitution is the proof" (adapter-seam.md).
 
 ## Guarantees and boundaries
 
-- A run overtaken by pause/cancel/scope change records nothing: the
-  supersession check runs after summarizing and before any entry is written
-  or any event is delivered, and recording is all-or-nothing per run.
+- A run overtaken by pause/cancel/scope change records nothing that the
+  runner did not already do: the supersession check before recording stops
+  observation and delivery entirely, and a change landing while a summary is
+  in flight suppresses delivery — but the already-sent summary means the log
+  keeps what the provider saw (adapter-seam discipline 3).
 - An activity-write failure never fails the run or blocks delivery; task
-  state and notifications do not depend on the log accepting an entry.
+  state and notifications do not depend on the log accepting an entry — on
+  every write path, including blocked and retry outcomes.
+- Retention bounds the per-poll history: each task keeps its most recent
+  `runner.OBSERVATION_RETENTION` `check-observed` entries (pruned after each
+  record); decisions and delivery records are never pruned. Event entries
+  carry the same `occurrence` identity the notification sink deduplicates
+  on, so a crash-and-replay duplicate is detectable from the log alone.
 - No new egress: the digest is the same whitelisted shape as event evidence
   (egress.md), redacted at write time like every other entry.
 - No schema migration: `activity.evidence` is free-form JSON.

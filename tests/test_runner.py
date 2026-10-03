@@ -254,3 +254,90 @@ def test_daemon_serve_stops_on_event(home: Path) -> None:
     stop.set()
     thread.join(timeout=2)
     assert not thread.is_alive()
+
+
+def test_observation_history_is_bounded_per_task(home: Path) -> None:
+    h = Harness(home)
+    h.github.add_check("ci", None, sha="s1", status="queued")
+    from nanodot.core.runner import OBSERVATION_RETENTION
+
+    for _ in range(OBSERVATION_RETENTION + 7):
+        h.tick()
+        h.clock.advance(CADENCE)
+
+    entries = h.activity.query(task_id=h.task.id, kinds=(CHECK_OBSERVED,), limit=1000)
+    assert len(entries) == OBSERVATION_RETENTION
+    # Decisions and delivery records are never pruned with the digests.
+    h.github.add_check("ci", FAILURE, sha="s1")
+    h.clock.advance(CADENCE)
+    assert h.tick() is RunOutcome.OK
+    kept = h.activity.query(task_id=h.task.id, limit=1000)
+    assert CHECKS_FAILED in [e.kind for e in kept]
+    assert len([e for e in kept if e.kind == CHECK_OBSERVED]) == OBSERVATION_RETENTION
+
+
+def test_activity_failure_does_not_damage_blocked_or_retry_paths(home: Path) -> None:
+    h = Harness(home)
+
+    class BrokenLog:
+        def append(self, **_: object) -> None:
+            raise sqlite3.OperationalError("disk I/O error")
+
+        def prune_observations(self, *_: object, **__: object) -> None:
+            pass
+
+    h.loop._activity = BrokenLog()
+    h.github.fail_with(TYPICAL_ERRORS["auth"])
+    assert h.tick() is RunOutcome.BLOCKED  # no exception despite the log
+    task = h.store.get(h.task.id)
+    assert task.state is TaskState.BLOCKED and "token revoked" in task.blocker
+    assert BLOCKED in h.sink.kinds()  # the user is still notified
+
+    resumed = h.store.resume(h.task.id, now=h.clock.now)
+    assert resumed.state is TaskState.ACTIVE
+    h.github.fail_with(TYPICAL_ERRORS["rate-limit"])
+    assert h.tick() is RunOutcome.RETRY_SCHEDULED  # no exception, no double count
+    saved = h.store.get(h.task.id)
+    assert saved.watch_state["consecutive_failures"] == 1
+    assert saved.next_check_at == h.clock.now + 600
+
+
+def test_egress_never_precedes_the_activity_record(home: Path) -> None:
+    from fakes import FakeProvider
+
+    class PausingProvider(FakeProvider):
+        """Cancels the watch while the summary request is in flight."""
+        def __init__(self, store: TaskStore, task_id: str):
+            super().__init__()
+            self.store = store
+            self.task_id = task_id
+            self.sent: list[str] = []
+
+        def summarize(self, change):
+            self.sent.append(change.kind)
+            cancelled = self.store.get(self.task_id)
+            cancelled.state = TaskState.CANCELLED
+            self.store.update(cancelled)
+            return "summary"
+
+    h = Harness(home)
+    provider = PausingProvider(h.store, h.task.id)
+    h.loop = TaskLoop(h.store, h.github, h.sink, h.activity, provider=provider)
+    h.github.add_check("ci", FAILURE, sha="s1")
+
+    assert h.tick() is RunOutcome.SKIPPED_TERMINAL
+    # Egress happened, so the log must already reconstruct it (discipline 3):
+    # the observation and the event were recorded before the provider call.
+    entries = h.activity.query(task_id=h.task.id, limit=100)
+    kinds = [e.kind for e in entries]
+    assert CHECK_OBSERVED in kinds and CHECKS_FAILED in kinds
+    assert provider.sent == [CHECKS_FAILED]
+    assert h.sink.kinds() == []  # delivery suppressed for a superseded run
+
+
+def test_event_records_carry_their_replay_identity(home: Path) -> None:
+    h = Harness(home)
+    h.github.add_check("ci", FAILURE, sha="s1")
+    h.tick()
+    entries = h.activity.query(task_id=h.task.id, kinds=(CHECKS_FAILED,))
+    assert entries[0].evidence["occurrence"]  # same identity the sink dedups on

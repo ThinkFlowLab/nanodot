@@ -8,7 +8,7 @@ import pytest
 from fakes import FakeGitHub, FAILURE, QUEUED, SUCCESS, TYPICAL_ERRORS
 from test_runner import Harness
 
-from nanodot.core.runner import RunOutcome, TaskLoop
+from nanodot.core.runner import CHECK_OBSERVED, RunOutcome, TaskLoop
 from nanodot.core.statemachine import CHECKS_FAILED, CHECKS_PASSED, CHECKS_PENDING, step
 from nanodot.core.tasks import (
     DEFAULT_STOP_CONDITIONS, SUPPORTED_NOTIFICATION_CONDITIONS,
@@ -329,7 +329,11 @@ def test_lifecycle_change_during_summary_prevents_notification_and_write(home, c
     }[change]
     assert h.tick() is expected
     assert h.sink.events == []
-    assert h.activity.query(task_id=h.task.id) == []
+    # Egress already happened (the summary was requested), so the log keeps
+    # what the provider saw — adapter-seam discipline 3 — while delivery and
+    # the task write stay suppressed for the superseded run.
+    kinds = [e.kind for e in h.activity.query(task_id=h.task.id)]
+    assert CHECK_OBSERVED in kinds and kinds[0] == CHECKS_PASSED
     saved = h.store.get(h.task.id)
     assert not saved.watch_state.get("terminal")
 

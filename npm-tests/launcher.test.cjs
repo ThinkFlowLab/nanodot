@@ -18,7 +18,16 @@ function fakePython() {
   const path = require('node:path');
   const config = JSON.parse(fs.readFileSync(path.join(ROOT, 'config.json')));
   const args = process.argv.slice(2);
-  if (args[0] === '-I') {
+  // The launcher probes the interpreter (same env as the real run) with a
+  // `sys.version_info` gate; the CLI entry is also `-c` but imports nanodot.
+  const probed = args[0] === '-c' && /sys\.version_info/.test(args[1] || '');
+  // A broken caller environment (e.g. a stray PYTHONHOME) only breaks the
+  // interpreter outside isolated mode: probes must see what runs will see.
+  if (config.brokenEnv && !args.includes('-I')) {
+    if (!probed) console.error('Fatal Python error: init_fs_encoding');
+    process.exit(1);
+  }
+  if (probed) {
     if (!MANAGED && !(config.workingPythons || []).includes(path.basename(__filename))) {
       process.exit(1);
     }
@@ -31,8 +40,11 @@ function fakePython() {
     input: config.readInput ? fs.readFileSync(0, 'utf8') : null,
   }) + '\n');
   if (config.waitForSignal) {
+    let interrupts = 0;
+    process.on('SIGINT', () => { interrupts += 1; });
     process.on('SIGTERM', () => {
       fs.writeFileSync(path.join(ROOT, 'terminated'), 'yes');
+      fs.writeFileSync(path.join(ROOT, 'interrupts'), String(interrupts));
       process.exit(0);
     });
     console.log('READY');
@@ -303,4 +315,43 @@ test('simultaneous first runs both receive a complete cached runtime', async t =
   const results = await Promise.all([invoke(), invoke()]);
   for (const result of results) assert.equal(result.code, 0, result.error);
   assert.deepEqual(fs.readdirSync(f.cache()).sort(), ['python', `uv-${UV_VERSION}`]);
+});
+
+test('a group-delivered SIGINT reaches the CLI exactly once', async t => {
+  const f = fixture(t, { waitForSignal: true });
+  f.warm();
+  // detached: the launcher leads its own process group, so a signal to the
+  // negative pid reproduces exactly what a terminal does on Ctrl-C.
+  const child = spawn(process.execPath, [path.join(f.pkg, 'bin', 'nanodot.cjs'), 'runner'], {
+    cwd: path.join(f.root, 'caller'), env: f.env, stdio: ['ignore', 'pipe', 'pipe'], detached: true,
+  });
+  t.after(() => { try { process.kill(-child.pid, 'SIGKILL'); } catch { /* already gone */ } });
+  let output = '';
+  await new Promise((resolve, reject) => {
+    child.on('error', reject);
+    child.stdout.on('data', chunk => {
+      output += chunk;
+      if (output.includes('READY')) resolve();
+    });
+    child.once('exit', code => { if (!output.includes('READY')) reject(new Error('early exit ' + code)); });
+  });
+  const done = once(child, 'close');
+  process.kill(-child.pid, 'SIGINT');
+  await new Promise(resolve => setTimeout(resolve, 200));
+  process.kill(-child.pid, 'SIGTERM');
+  const [code] = await done;
+  assert.equal(code, 0);
+  assert.equal(fs.readFileSync(path.join(f.root, 'terminated'), 'utf8'), 'yes');
+  // Re-forwarding the group-delivered SIGINT would land a second interrupt
+  // inside the CLI's graceful teardown.
+  assert.equal(fs.readFileSync(path.join(f.root, 'interrupts'), 'utf8'), '1');
+});
+
+test('a Python broken by the caller environment fails probing cleanly', t => {
+  const f = fixture(t, { brokenEnv: true });
+  f.warm();
+  const result = f.invoke('--version');
+  assert.notEqual(result.status, 0);
+  assert.doesNotMatch(result.stderr, /Fatal Python error/);
+  assert.match(result.stderr, /nanodot:/);
 });
