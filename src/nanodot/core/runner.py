@@ -247,6 +247,8 @@ class TaskLoop:
         if self._write is not None:
             for event in self._write.recover(task, now):
                 self._sink.notify(event)
+            for event in self._write.expire_unused(task, now):
+                self._sink.notify(event)
             for event in self._write.execute_pending(
                 task, now, superseded=lambda: bool(self._superseded(task))
             ):
