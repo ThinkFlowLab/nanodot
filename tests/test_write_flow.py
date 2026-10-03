@@ -37,6 +37,7 @@ from nanodot.core.write_flow import (
     WriteFlow,
 )
 from nanodot.core.tasks import PRTarget, Task, TaskStore
+from nanodot.core.statemachine import CHECKS_FAILED, WatchEvent
 from nanodot.native.github_client import GitHubSnapshotFetcher
 from nanodot.native.secrets_file import FileSecretStore
 from nanodot.ports.github_writer import (
@@ -484,6 +485,84 @@ def test_full_proposal_approval_execution_lifecycle(home: Path) -> None:
     task = h.store.get(h.task.id)
     assert task.state.value == "active"
     assert task.next_check_at is not None
+
+
+# -- approved-state lifecycle (#65, #66) -------------------------------------------
+
+
+def _failure_event(h: Harness, sha: str = "s1") -> WatchEvent:
+    """A checks-failed event with the same evidence shape the state machine
+    emits — reruns failing again on the same head produce these."""
+    return WatchEvent(
+        kind=CHECKS_FAILED,
+        message="checks failed",
+        evidence={
+            "head_sha": sha,
+            "pr_state": "open",
+            "url": f"https://github.com/{TARGET}/pull/9",
+            "checks": [{"name": "ci", "conclusion": "failure"}],
+        },
+        task_id=h.task.id,
+        at=h.clock.time(),
+    )
+
+
+def test_executed_content_is_never_re_asked_after_a_rerun_failure(home: Path) -> None:
+    """#65: a rerun failing again on the same head is a new checks-failed
+    event with byte-identical draft content — exactly one request, one
+    approval, one comment, never a second ask."""
+    h = Harness(home)
+    h.tick()
+    h.approve_proposal()
+    h.clock.advance(300)
+    h.tick()
+    assert len(h.writer.sends) == 1
+
+    assert h.write.propose_write(h.store.get(h.task.id), _failure_event(h)) is None
+    assert h.write.propose_write(h.store.get(h.task.id), _failure_event(h)) is None
+    assert len(h.permissions.request_history()) == 1
+    assert len(h.writer.sends) == 1  # no double comment
+
+
+def test_approved_but_unsent_content_is_not_re_asked_but_new_content_is(
+    home: Path,
+) -> None:
+    """#65: the approved-but-queued window produces no duplicate ask; a new
+    head SHA (new content, new digest) proposes normally."""
+    h = Harness(home)
+    h.tick()
+    h.approve_proposal()  # queued, not yet executed
+
+    assert h.write.propose_write(h.store.get(h.task.id), _failure_event(h)) is None
+
+    new_head = h.write.propose_write(h.store.get(h.task.id), _failure_event(h, sha="s2"))
+    assert new_head is not None and new_head.kind == WRITE_PROPOSED
+
+
+def test_expired_unused_capability_notifies_once_and_reopens_the_ask(
+    home: Path,
+) -> None:
+    """#66: an approval whose grant expires unused is a notified failure —
+    never silence — and its content becomes askable again."""
+    h = Harness(home)
+    h.tick()
+    h.approve_proposal()
+    h.clock.advance(24 * 3600 + 10)  # past the request TTL, runner was "down"
+    outcome = h.tick()
+    assert outcome is RunOutcome.OK
+
+    assert len(h.writer.sends) == 0  # nothing was ever sent
+    failures = [e for e in h.sink.events if e.kind == WRITE_FAILED]
+    assert len(failures) == 1, "exactly one lost-write notification"
+    assert "expired" in failures[0].message
+    assert "never executed" in failures[0].message
+
+    # The content is askable again; a second tick does not re-notify.
+    assert h.write.propose_write(h.store.get(h.task.id), _failure_event(h)) is not None
+    h.clock.advance(300)
+    h.tick()
+    assert len([e for e in h.sink.events if e.kind == WRITE_FAILED]) == 1
+    assert h.permissions.pending(), "the re-opened ask is pending again"
 
 
 # -- native writer transport (offline, fake urlopen) ----------------------------

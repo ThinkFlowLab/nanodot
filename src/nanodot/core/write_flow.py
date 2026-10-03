@@ -91,8 +91,11 @@ class WriteFlow:
         payload["body"] = self._redactor.scrub(payload["body"])
         digest = payload_digest(payload)
         prior = self._permissions.has_verbatim_request(task.id, digest)
-        if prior in ("pending", "denied"):
-            return None  # never duplicate a pending ask, never re-ask a denial
+        # pending: never duplicate the ask. denied: an answer stands.
+        # approved: asked and answered — identical content is never re-asked;
+        # only an expired-unused capability re-opens it (expire_unused below).
+        if prior in ("pending", "denied", "approved"):
+            return None
         scope_hint = f"{WATCH_SCOPE}:{event.evidence.get('head_sha', '')[:10]}"
         request = self._permissions.request(
             action=COMMENT_ACTION,
@@ -123,6 +126,33 @@ class WriteFlow:
         return proposed
 
     # -- executing ---------------------------------------------------------------
+
+    def expire_unused(self, task: Task, now: float) -> list[WatchEvent]:
+        """Retire approved-but-never-executed capabilities whose grant has
+        expired (#66): one notified failure per lost write, and the content
+        becomes askable again. Silence after an approval is never allowed."""
+        events: list[WatchEvent] = []
+        for capability in self._permissions.expire_unused(task.id):
+            event = WatchEvent(
+                kind=WRITE_FAILED,
+                message=(
+                    f"approved comment on {capability.target} was never executed: "
+                    "its approval expired unused (the runner was not running "
+                    "before the request's expiry). It will be proposed again "
+                    "if the failure recurs — nothing was sent"
+                ),
+                evidence={
+                    "grant_id": capability.grant_id,
+                    "content_hash": capability.content_hash,
+                },
+                notable=True,
+                task_id=task.id,
+                at=now,
+                occurrence=capability.grant_id,
+            )
+            self._append(event)
+            events.append(event)
+        return events
 
     def execute_pending(
         self, task: Task, now: float,

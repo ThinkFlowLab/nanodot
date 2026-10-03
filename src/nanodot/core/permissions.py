@@ -102,7 +102,8 @@ CREATE TABLE IF NOT EXISTS capabilities (
   content_hash TEXT NOT NULL,
   content TEXT NOT NULL,
   issued_at REAL NOT NULL,
-  used_at REAL
+  used_at REAL,
+  expired_at REAL
 );
 """
 
@@ -159,6 +160,7 @@ class PermissionCenter:
             _ensure_column(self._conn, "grants", "content_hash TEXT NOT NULL DEFAULT ''")
             _ensure_column(self._conn, "requests", "content_hash TEXT NOT NULL DEFAULT ''")
             _ensure_column(self._conn, "requests", "content TEXT NOT NULL DEFAULT ''")
+            _ensure_column(self._conn, "capabilities", "expired_at REAL")
             self._conn.commit()
 
     # -- mode ---------------------------------------------------------------
@@ -278,7 +280,9 @@ class PermissionCenter:
                     ),
                 )
                 self._conn.execute(
-                    "INSERT INTO capabilities VALUES (?,?,?,?,?,?,NULL)",
+                    "INSERT INTO capabilities "
+                    "(grant_id, action, target, content_hash, content, issued_at) "
+                    "VALUES (?,?,?,?,?,?)",
                     (
                         grant.id, req.action, req.target, req.content_hash,
                         req.content, now,
@@ -329,6 +333,44 @@ class PermissionCenter:
             )
             for row in rows
         ]
+
+    def expire_unused(self, task_id: str) -> list[WriteCapability]:
+        """Atomically retire approved-but-never-executed capabilities whose
+        grant has expired, and re-open their content for asking (#66).
+
+        An approval must never vanish silently: each retired capability is
+        returned exactly once (marked ``expired_at``) so the flow can notify,
+        and its verbatim request returns to ``expired`` — re-askable, never
+        mistaken for an answered approval."""
+        now = self._clock.time()
+        with self._lock, self._conn:
+            self._conn.execute("BEGIN IMMEDIATE")
+            rows = self._conn.execute(
+                "SELECT c.grant_id, c.action, c.target, c.content_hash "
+                "FROM capabilities c JOIN grants g ON c.grant_id = g.id "
+                "WHERE g.task_id=? AND c.used_at IS NULL AND c.expired_at IS NULL "
+                "AND g.revoked_at IS NULL "
+                "AND g.expires_at IS NOT NULL AND g.expires_at <= ?",
+                (task_id, now),
+            ).fetchall()
+            retired: list[WriteCapability] = []
+            for row in rows:
+                self._conn.execute(
+                    "UPDATE capabilities SET expired_at=? WHERE grant_id=?",
+                    (now, row["grant_id"]),
+                )
+                self._conn.execute(
+                    "UPDATE requests SET state='expired' "
+                    "WHERE task_id=? AND content_hash=? AND state='approved'",
+                    (task_id, row["content_hash"]),
+                )
+                retired.append(
+                    WriteCapability(
+                        action=row["action"], target=row["target"],
+                        content_hash=row["content_hash"], grant_id=row["grant_id"],
+                    )
+                )
+            return retired
 
     def has_verbatim_request(self, task_id: str, content_hash: str) -> str | None:
         """The state of an earlier request for this exact content, if any —
