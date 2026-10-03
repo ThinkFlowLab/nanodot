@@ -34,6 +34,7 @@ SUMMARY_BUDGET_SECONDS = 1.0
 CHECK_OBSERVED = "check-observed"  # per-poll record of what the runner saw
 DIGEST = "digest"  # scheduled status heartbeat (issue #80)
 STALE = "stale"  # once-per-commit idle alert (issue #84)
+FLAKY = "flaky"  # same-SHA conclusion flip (issue #86)
 OBSERVATION_RETENTION = 20  # recent per-poll digests kept per task
 
 
@@ -337,6 +338,9 @@ class TaskLoop:
         if task.stale_after_seconds is not None:
             if self._superseded(task) is None:
                 self._maybe_stale(task, snapshot, events, now)
+        if task.flaky_alerts:
+            if self._superseded(task) is None:
+                self._maybe_flaky(task, snapshot, now)
 
         terminal = any(event.terminal for event in events)
         if terminal:
@@ -450,6 +454,66 @@ class TaskLoop:
         )
         self._record_event(stale)
         self._sink.notify(stale)
+
+    def _maybe_flaky(self, task: Task, snapshot, now: float) -> None:
+        """One notification per same-SHA conclusion flip: intra-snapshot
+        (a poll holding both a red and a green run for one name) or
+        cross-poll (the tracked per-name conclusion flipped). Non-definitive
+        states never participate; a new head SHA resets the map."""
+        from nanodot.core.tasks import GREEN_CONCLUSIONS, RED_CONCLUSIONS
+
+        state = task.watch_state
+        tracked = dict(state.get("flaky_seen") or {})
+        flips = state.get("flaky_flips") or {}
+        if state.get("flaky_sha") != snapshot.head_sha:
+            tracked, flips = {}, {}
+        events = []
+        per_name: dict[str, set[str]] = {}
+        for run in snapshot.checks_for(snapshot.head_sha):
+            if run.conclusion in RED_CONCLUSIONS:
+                per_name.setdefault(run.name, set()).add("red")
+            elif run.conclusion in GREEN_CONCLUSIONS:
+                per_name.setdefault(run.name, set()).add("green")
+        for name, families in sorted(per_name.items()):
+            red, green = "red" in families, "green" in families
+            if red and green:
+                direction = "red+green"
+            elif tracked.get(name) == "green" and red:
+                direction = "green->red"
+            elif tracked.get(name) == "red" and green:
+                direction = "red->green"
+            else:
+                continue
+            sequence = int(flips.get(name, 0)) + 1
+            flips[name] = sequence
+            events.append(WatchEvent(
+                kind=FLAKY,
+                message=(
+                    f"flaky: {name} flipped ({direction}) on "
+                    f"{snapshot.head_sha[:10]} for {task.target}"
+                ),
+                evidence={
+                    **statemachine.observation(snapshot),
+                    "rule": "notify: flaky check",
+                    "check": name,
+                    "direction": direction,
+                },
+                notable=True,
+                task_id=task.id,
+                at=now,
+                occurrence=f"flaky-{snapshot.head_sha[:10]}-{name}-{sequence}",
+            ))
+        # Track the latest definitive conclusion per name for cross-poll.
+        for name, families in per_name.items():
+            if len(families) == 1:
+                tracked[name] = next(iter(families))
+        task.watch_state = dict(
+            state, flaky_sha=snapshot.head_sha, flaky_seen=tracked,
+            flaky_flips=flips,
+        )
+        for event in events:
+            self._record_event(event)
+            self._sink.notify(event)
 
     def _prune_observations(self, task_id: str) -> None:
         """Retention is best-effort: a failing prune must not fail the run."""
