@@ -351,3 +351,26 @@ def test_watch_add_digest_persists_and_shows(
             main(["watch", "add", TARGET, "--digest", "2d"])
     assert caught.value.code == 2
     assert len(TaskStore().list()) == 1
+
+
+def test_watch_add_stale_persists_and_shows(
+    home: Path, token: str, capsys: pytest.CaptureFixture[str]
+) -> None:
+    def fake_input(prompt: str = "") -> str:
+        return "y"
+
+    with mock.patch("builtins.input", side_effect=fake_input):
+        assert main(["watch", "add", TARGET, "--stale", "3d", "--digest", "24h"]) == 0
+    out = capsys.readouterr().out
+    assert "stale alert:" in out and "digest:" in out
+    task = TaskStore().list()[0]
+    assert task.stale_after_seconds == 259200
+    assert task.digest_interval_seconds == 86400
+
+    assert main(["watch", "show", task.id]) == 0
+    assert "stale alert:" in capsys.readouterr().out
+
+    with mock.patch("builtins.input", side_effect=fake_input):
+        with pytest.raises(SystemExit) as caught:
+            main(["watch", "add", TARGET, "--stale", "5d"])
+    assert caught.value.code == 2

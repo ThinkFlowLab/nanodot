@@ -77,6 +77,11 @@ def build_parser() -> argparse.ArgumentParser:
         choices=["off", "6h", "12h", "24h"],
         help="scheduled status heartbeat: one digest per interval",
     )
+    add.add_argument(
+        "--stale", default="off",
+        choices=["off", "2d", "3d", "7d", "14d"],
+        help="idle alert: one notification when the head sits unchanged",
+    )
 
     # -- memory ------------------------------------------------------------
     memory = subparsers.add_parser("memory", help="what nanodot retained, and why")
@@ -424,6 +429,8 @@ def _run_watch(args: argparse.Namespace) -> int:
             return 1
         try:
             digest_map = {"off": None, "6h": 21600, "12h": 43200, "24h": 86400}
+            stale_map = {"off": None, "2d": 172800, "3d": 259200,
+                         "7d": 604800, "14d": 1209600}
             task = Task(
                 target=target,
                 purpose=redactor.scrub(purpose),
@@ -431,6 +438,7 @@ def _run_watch(args: argparse.Namespace) -> int:
                 notification_conditions=args.notify,
                 stop_conditions=args.stop,
                 digest_interval_seconds=digest_map[args.digest],
+                stale_after_seconds=stale_map[args.stale],
                 next_check_at=time.time(),
             )
             task.validate()
@@ -444,6 +452,8 @@ def _run_watch(args: argparse.Namespace) -> int:
         print(f"  cadence:                every {task.cadence_seconds}s")
         if task.digest_interval_seconds is not None:
             print(f"  digest:                 every {task.digest_interval_seconds}s")
+        if task.stale_after_seconds is not None:
+            print(f"  stale alert:            after {task.stale_after_seconds}s idle")
         print(f"  allowed actions:        read-only (no external writes)")
         if auth_mode == "anonymous":
             print("  GitHub access:          anonymous (public repositories only)")
@@ -508,6 +518,8 @@ def _run_watch(args: argparse.Namespace) -> int:
     print(f"  cadence:                every {task.cadence_seconds}s")
     if task.digest_interval_seconds is not None:
         print(f"  digest:                 every {task.digest_interval_seconds}s")
+    if task.stale_after_seconds is not None:
+        print(f"  stale alert:            after {task.stale_after_seconds}s idle")
     print(f"  allowed actions:        read-only")
     print(f"  notification conditions:{task.notification_conditions}")
     print(f"  stop conditions:        {task.stop_conditions}")

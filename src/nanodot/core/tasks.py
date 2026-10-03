@@ -49,6 +49,9 @@ SUPPORTED_STOP_CONDITIONS = frozenset(
 )
 # Digest windows (issue #80): a fixed enum, never a free-form interval.
 SUPPORTED_DIGEST_INTERVALS = frozenset({21600, 43200, 86400})  # 6h/12h/24h
+# Stale thresholds (issue #84): days a head may sit unchanged before the
+# once-per-commit alert; a fixed enum.
+SUPPORTED_STALE_AFTER = frozenset({172800, 259200, 604800, 1209600})  # 2d..14d
 
 
 class TaskError(ValueError):
@@ -102,6 +105,7 @@ class Task:
     updated_at: float = field(default_factory=time.time)
     next_check_at: float | None = None
     digest_interval_seconds: int | None = None  # None = no scheduled digest
+    stale_after_seconds: int | None = None  # None = no stale alert
     watch_state: dict = field(default_factory=dict)
     id: str = field(default_factory=lambda: uuid.uuid4().hex[:12])
 
@@ -134,6 +138,13 @@ class Task:
                 "digest interval must be one of: 21600 (6h), 43200 (12h), "
                 "86400 (24h), or omitted"
             )
+        if self.stale_after_seconds is not None and (
+            self.stale_after_seconds not in SUPPORTED_STALE_AFTER
+        ):
+            raise TaskError(
+                "stale threshold must be one of: 172800 (2d), 259200 (3d), "
+                "604800 (7d), 1209600 (14d), or omitted"
+            )
 
 
 _SCHEMA = """
@@ -152,6 +163,7 @@ CREATE TABLE IF NOT EXISTS tasks (
   updated_at REAL NOT NULL,
   next_check_at REAL,
   digest_interval_seconds INTEGER,
+  stale_after_seconds INTEGER,
   watch_state TEXT NOT NULL DEFAULT '{}'
 );
 """
@@ -176,6 +188,7 @@ class TaskStore:
         with self._lock:
             self._conn.executescript(_SCHEMA)
             self._ensure_digest_column()
+            self._ensure_stale_column()
             self._conn.commit()
 
     def _ensure_digest_column(self) -> None:
@@ -186,6 +199,16 @@ class TaskStore:
         if "digest_interval_seconds" not in columns:
             self._conn.execute(
                 "ALTER TABLE tasks ADD COLUMN digest_interval_seconds INTEGER"
+            )
+
+    def _ensure_stale_column(self) -> None:
+        """Additive migration (legacy rows keep NULL = stale off)."""
+        columns = {
+            row["name"] for row in self._conn.execute("PRAGMA table_info(tasks)")
+        }
+        if "stale_after_seconds" not in columns:
+            self._conn.execute(
+                "ALTER TABLE tasks ADD COLUMN stale_after_seconds INTEGER"
             )
 
     # -- mapping helpers -------------------------------------------------
@@ -212,6 +235,7 @@ class TaskStore:
             updated_at=row["updated_at"],
             next_check_at=row["next_check_at"],
             digest_interval_seconds=row["digest_interval_seconds"],
+            stale_after_seconds=row["stale_after_seconds"],
             watch_state=json.loads(row["watch_state"]),
         )
 
@@ -231,6 +255,7 @@ class TaskStore:
             task.updated_at,
             task.next_check_at,
             task.digest_interval_seconds,
+            task.stale_after_seconds,
             json.dumps(task.watch_state),
         )
 
@@ -251,7 +276,7 @@ class TaskStore:
         try:
             with self._lock, self._conn:
                 self._conn.execute(
-                    "INSERT INTO tasks VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    "INSERT INTO tasks VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                     self._task_to_values(task),
                 )
         except sqlite3.IntegrityError as error:
@@ -319,7 +344,7 @@ class TaskStore:
                 "UPDATE tasks SET target=?, purpose=?, cadence_seconds=?, "
                 "allowed_actions=?, notification_conditions=?, stop_conditions=?, "
                 "state=?, blocker=?, scope_version=?, created_at=?, updated_at=?, "
-                "next_check_at=?, digest_interval_seconds=?, watch_state=? WHERE id=?",
+                "next_check_at=?, digest_interval_seconds=?, stale_after_seconds=?, watch_state=? WHERE id=?",
                 self._task_to_values(task)[1:] + (task.id,),
             )
         return task
