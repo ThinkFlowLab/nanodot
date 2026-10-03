@@ -42,6 +42,7 @@ class FakeGitHub(SnapshotFetcher):
         self.checks: dict[str, list[CheckRun]] = {}
         self.error: Exception | None = None
         self.fetch_calls = 0
+        self.rate_limit_remaining: int | None = None
 
     def set_pr(self, state: str, head_sha: str | None = None) -> None:
         self.pr_state = state
@@ -76,6 +77,7 @@ class FakeGitHub(SnapshotFetcher):
                 for run in self.checks.get(self.head_sha, ())
             ),
             checks_complete=True,
+            rate_limit_remaining=self.rate_limit_remaining,
             fetched_at=time.time(),
             url=f"https://github.com/{self.target.owner}/{self.target.repo}"
             f"/pull/{self.target.number}",

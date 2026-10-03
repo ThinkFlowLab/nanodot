@@ -62,7 +62,7 @@ class GitHubSnapshotFetcher(SnapshotFetcher):
             )
         return token
 
-    def _get(self, path: str) -> dict | list:
+    def _get(self, path: str, quota: dict | None = None) -> dict | list:
         url = f"{self._base_url}{path}"
         headers = {
             "Accept": "application/vnd.github+json",
@@ -85,6 +85,23 @@ class GitHubSnapshotFetcher(SnapshotFetcher):
         )
         try:
             with authenticated_urlopen(request, timeout=30) as response:
+                if quota is not None:
+                    # Per-fetch accumulator: the tightest remaining seen.
+                    # Advisory transport metadata, never snapshot identity;
+                    # a transport without headers simply reports none.
+                    try:
+                        value = int(
+                            getattr(response, "headers", {}).get(
+                                "X-RateLimit-Remaining"
+                            )
+                        )
+                    except (TypeError, ValueError, AttributeError):
+                        value = None
+                    if value is not None:
+                        quota["remaining"] = (
+                            value if "remaining" not in quota
+                            else min(quota["remaining"], value)
+                        )
                 result = json.loads(response.read().decode())
                 if not isinstance(result, (dict, list)):
                     raise RetryableError("malformed GitHub response")
@@ -135,7 +152,8 @@ class GitHubSnapshotFetcher(SnapshotFetcher):
             # routine transport failure and belongs with network trouble.
             raise RetryableError(f"network error: {error}") from error
 
-    def _pages(self, path: str, key: str | None = None, sha: str | None = None) -> list[dict]:
+    def _pages(self, path: str, key: str | None = None, sha: str | None = None,
+               quota: dict | None = None) -> list[dict]:
         """Read all pages; never follow server-supplied URLs with our token.
 
         Counts must stay consistent. An incomplete/changing result is a
@@ -146,7 +164,7 @@ class GitHubSnapshotFetcher(SnapshotFetcher):
         seen: set[int] = set()
         separator = "&" if "?" in path else "?"
         for page in range(1, 1001):
-            data = self._get(f"{path}{separator}per_page=100&page={page}")
+            data = self._get(f"{path}{separator}per_page=100&page={page}", quota=quota)
             if key is not None:
                 count = data["total_count"]
                 if type(count) is not int or count < 0:
@@ -207,7 +225,8 @@ class GitHubSnapshotFetcher(SnapshotFetcher):
             return None
         return required
 
-    def _required_checks(self, repo: str, base_ref: str) -> tuple[RequiredCheck, ...] | None:
+    def _required_checks(self, repo: str, base_ref: str,
+                        quota: dict | None = None) -> tuple[RequiredCheck, ...] | None:
         """Union classic protection and every active inherited ruleset.
 
         A 404 on protection can mean absent OR hidden metadata: never treat
@@ -216,7 +235,7 @@ class GitHubSnapshotFetcher(SnapshotFetcher):
         """
         branch_path = f"/repos/{repo}/branches/{quote(base_ref, safe='')}"
         try:
-            branch = self._get(branch_path)
+            branch = self._get(branch_path, quota=quota)
             if branch.get("protected") is False:
                 required = []
             else:
@@ -226,11 +245,13 @@ class GitHubSnapshotFetcher(SnapshotFetcher):
                 else:
                     required = self._requirements(summary) if summary is not None else None
                     if required is None:
-                        protection = self._get(f"{branch_path}/protection")
+                        protection = self._get(f"{branch_path}/protection", quota=quota)
                         required = self._requirements(protection["required_status_checks"])
                     if required is None:
                         return None
-            rules = self._pages(f"/repos/{repo}/rules/branches/{quote(base_ref, safe='')}")
+            rules = self._pages(
+                f"/repos/{repo}/rules/branches/{quote(base_ref, safe='')}", quota=quota
+            )
             # These have no check-context requirements. Other/new rule types
             # (workflows, code scanning, merge queues, deployments) need
             # additional evidence which this head-check watcher cannot prove.
@@ -263,12 +284,14 @@ class GitHubSnapshotFetcher(SnapshotFetcher):
             return None  # metadata inaccessible; observed green checks prove nothing
 
     def _check_runs(
-        self, repo: str, head_sha: str, required: tuple[RequiredCheck, ...] | None
+        self, repo: str, head_sha: str, required: tuple[RequiredCheck, ...] | None,
+        quota: dict | None = None,
     ) -> list[CheckRun]:
         runs: list[CheckRun] = []
         # Enumerate suites instead of using commits/{sha}/check-runs, whose
         # results silently omit suites beyond the newest 1,000.
-        suites = self._pages(f"/repos/{repo}/commits/{head_sha}/check-suites", "check_suites")
+        suites = self._pages(f"/repos/{repo}/commits/{head_sha}/check-suites", "check_suites",
+                             quota=quota)
         for suite in suites:
             suite_id = suite["id"]
             if suite["head_sha"] != head_sha:
@@ -279,7 +302,8 @@ class GitHubSnapshotFetcher(SnapshotFetcher):
                     or not isinstance(app_slug, str) or not app_slug):
                 raise RetryableError("missing GitHub check source")
             suite_runs = self._pages(
-                f"/repos/{repo}/check-suites/{suite_id}/check-runs?filter=all", "check_runs"
+                f"/repos/{repo}/check-suites/{suite_id}/check-runs?filter=all", "check_runs",
+                quota=quota
             )
             unresolved = suite["status"] != "completed"
             relevant = required is not None and any(
@@ -291,7 +315,8 @@ class GitHubSnapshotFetcher(SnapshotFetcher):
                 # Manual workflow_dispatch runs are not eligible required
                 # PR checks. Prove the workflow event and latest rerun state.
                 workflows = self._pages(
-                    f"/repos/{repo}/actions/runs?check_suite_id={suite_id}", "workflow_runs"
+                    f"/repos/{repo}/actions/runs?check_suite_id={suite_id}", "workflow_runs",
+                    quota=quota
                 )
                 # Reusable workflows (workflow_call) run on the PR head with
                 # their own suite and are legitimate required PR checks; runs
@@ -332,7 +357,8 @@ class GitHubSnapshotFetcher(SnapshotFetcher):
                 for name in {run["name"] for run in suite_runs} or {""}:
                     runs.append(CheckRun(name, "queued", None, head_sha,
                                          source="check_suite", app_id=app_id, suite_id=suite_id))
-        if self._pages(f"/repos/{repo}/commits/{head_sha}/check-suites", "check_suites") != suites:
+        if self._pages(f"/repos/{repo}/commits/{head_sha}/check-suites", "check_suites",
+                       quota=quota) != suites:
             raise RetryableError("GitHub check suites changed during snapshot fetch")
         return runs
 
@@ -347,7 +373,8 @@ class GitHubSnapshotFetcher(SnapshotFetcher):
     def _fetch(self, target: PRTarget) -> Snapshot:
         repo = f"{target.owner}/{target.repo}"
         pull_path = f"/repos/{repo}/pulls/{target.number}"
-        pull = self._get(pull_path)
+        quota: dict = {}
+        pull = self._get(pull_path, quota=quota)
         head_sha = pull["head"]["sha"]
         if not isinstance(head_sha, str) or not head_sha:
             raise RetryableError("missing GitHub head reference")
@@ -357,15 +384,17 @@ class GitHubSnapshotFetcher(SnapshotFetcher):
         if pr_state in {"merged", "closed"}:
             # PR termination is independent of check/metadata availability.
             return Snapshot(target, pr_state, head_sha, (), time.time(),
-                            f"https://github.com/{repo}/pull/{target.number}")
+                            f"https://github.com/{repo}/pull/{target.number}",
+                            rate_limit_remaining=quota.get("remaining"))
         base_ref = pull["base"]["ref"]
         if not isinstance(base_ref, str) or not base_ref:
             raise RetryableError("missing GitHub base reference")
-        required = self._required_checks(repo, base_ref)
-        runs = self._check_runs(repo, head_sha, required)
+        required = self._required_checks(repo, base_ref, quota=quota)
+        runs = self._check_runs(repo, head_sha, required, quota=quota)
         # The combined status endpoint returns the latest result per context,
         # with an explicit SHA and total_count; its contexts still paginate.
-        for status in self._pages(f"/repos/{repo}/commits/{head_sha}/status", "statuses", sha=head_sha):
+        for status in self._pages(f"/repos/{repo}/commits/{head_sha}/status", "statuses",
+                                  sha=head_sha, quota=quota):
             name, state = status["context"], status["state"]
             if not isinstance(name, str) or not name or not isinstance(state, str):
                 raise RetryableError("malformed GitHub commit status")
@@ -374,7 +403,7 @@ class GitHubSnapshotFetcher(SnapshotFetcher):
                                  head_sha, source="status", run_id=status["id"]))
         # A push or retarget while pages were being read invalidates this
         # snapshot. The next poll starts again from the new head/base.
-        fresh = self._get(pull_path)
+        fresh = self._get(pull_path, quota=quota)
         if type(fresh["merged"]) is not bool:
             raise RetryableError("invalid GitHub PR state")
         if (fresh["head"]["sha"], fresh["base"]["ref"], fresh["state"], fresh["merged"]) != (
@@ -384,4 +413,5 @@ class GitHubSnapshotFetcher(SnapshotFetcher):
         return Snapshot(target=target, pr_state=pr_state, head_sha=head_sha,
                         checks=tuple(runs), fetched_at=time.time(),
                         url=f"https://github.com/{repo}/pull/{target.number}",
-                        required_checks=required, checks_complete=True)
+                        required_checks=required, checks_complete=True,
+                        rate_limit_remaining=quota.get("remaining"))
