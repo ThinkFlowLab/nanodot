@@ -5,16 +5,12 @@ single method executes a write through a ``WriteCapability`` — a
 human-approved, content-bound, single-use capability — so core can never
 reach the wire without an approval, by construction rather than convention.
 
-No production caller exists yet: the credential lands in #52, the
-capability store and approvals surface in #55, the first action in #54.
-Until then this port exists so the no-external-write invariant can be
-pinned to one place — non-GET request construction lives in the write
-port's native adapter and nowhere else.
-
-Sequencing note: ``used_at`` is carried by the capability but marked by the
-capability store's atomic consume when #55 lands; ``write-intent`` crash
-logging joins with the first action (#54). The port surface itself is
-frozen here: exactly ``{execute}``, and exactly these capability fields.
+Non-GET request construction lives in the write port's native adapter and
+nowhere else; the CLI wires ``WriteFlow`` + the native writer when the
+permission mode is gated. ``used_at`` is marked by the capability store's
+atomic consume; ``write-intent`` crash logging precedes every send. The
+port surface is frozen: exactly ``{execute}``, and exactly these
+capability fields.
 """
 
 from __future__ import annotations
