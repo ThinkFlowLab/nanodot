@@ -25,8 +25,10 @@ try {
   const packed = JSON.parse(run(process.execPath, [npm, 'pack', '--json', '--pack-destination', temporary], root))[0];
   const paths = packed.files.map(file => file.path);
   assert(paths.includes('bin/nanodot.cjs'));
+  assert(paths.includes('bin/uv-manifest.json'));
   assert(paths.includes('src/nanodot/cli.py'));
-  assert(paths.every(file => ['package.json', 'README.md', 'bin/nanodot.cjs'].includes(file)
+  assert(paths.every(file =>
+    ['package.json', 'README.md', 'bin/nanodot.cjs', 'bin/uv-manifest.json'].includes(file)
     || (file.startsWith('src/nanodot/') && file.endsWith('.py'))), paths);
   const archive = path.join(temporary, packed.filename);
   const prefix = path.join(temporary, 'global prefix');
