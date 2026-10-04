@@ -197,3 +197,40 @@ def test_flip_on_the_completing_poll_fires_alongside_terminal(home: Path) -> Non
     kinds = [e.kind for e in h.sink.events]
     assert CHECKS_PASSED in kinds
     assert FLAKY in kinds
+
+
+# -- #93: a flip is keyed to evidence, not to the poll -----------------------
+
+
+def test_stable_red_green_snapshot_fires_once_across_polls(home: Path) -> None:
+    """#93: GitHub retains reruns, so an unchanged red+green listing is the
+    NORM after a flaky check — it must be one notification, not one per
+    poll. The pre-fix behavior was an unbounded notification flood."""
+    h = Harness(home)
+    h.github.add_check("ci", FAILURE, sha="s1")
+    h.github.add_check("ci", SUCCESS, sha="s1")
+    h.tick()
+    h.tick(advance=300)
+    h.tick(advance=300)
+    flakes = h.flakes()
+    assert len(flakes) == 1
+    assert flakes[0].occurrence == "flaky-s1-ci-1"
+
+
+def test_collapse_after_an_intra_pair_is_a_new_flip(home: Path) -> None:
+    """#93: after the intra pair fires, the tracker holds the latest run's
+    family — a later listing collapse to the opposite single family is
+    genuinely new evidence and fires cross-poll."""
+    h = Harness(home)
+    h.github.add_check("ci", FAILURE, sha="s1")
+    h.github.add_check("ci", SUCCESS, sha="s1")
+    h.tick()
+    h.github.checks["s1"] = [
+        CheckRun(name="ci", status=COMPLETED, conclusion=FAILURE, sha="s1", run_id=1)
+    ]
+    h.tick(advance=300)
+    flakes = h.flakes()
+    assert len(flakes) == 2
+    assert "red+green" in flakes[0].message
+    assert "green->red" in flakes[1].message
+    assert flakes[1].occurrence == "flaky-s1-ci-2"
