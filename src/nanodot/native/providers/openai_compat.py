@@ -129,7 +129,12 @@ class APIInferenceProvider(InferenceProvider):
             )
             with authenticated_urlopen(request, timeout=self._timeout) as response:
                 payload = json.loads(response.read().decode())
-            _record_usage(self._name, self._usage, payload.get("usage") or {})
+            # Usage accounting degrades on non-dict payloads (null, arrays,
+            # error pages): the content parse below owns the ProviderError.
+            usage_block = (
+                payload.get("usage") or {} if isinstance(payload, dict) else {}
+            )
+            _record_usage(self._name, self._usage, usage_block)
         except urllib.error.HTTPError as error:
             detail = self._scrub(error.read().decode(errors="replace"))[:200]
             retry_after = _retry_after_seconds(error.headers)

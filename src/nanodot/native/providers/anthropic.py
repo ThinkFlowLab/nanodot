@@ -101,7 +101,11 @@ class AnthropicProvider(InferenceProvider):
             )
             with authenticated_urlopen(request, timeout=self._timeout) as response:
                 payload = json.loads(response.read().decode())
-            usage_block = payload.get("usage") or {}
+            # Same degradation as openai_compat: a non-dict payload skips
+            # accounting; the content parse below raises the ProviderError.
+            usage_block = (
+                payload.get("usage") or {} if isinstance(payload, dict) else {}
+            )
             if self._usage is not None and usage_block:
                 from nanodot.native.providers.openai_compat import _tokens_of
 
