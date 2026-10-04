@@ -430,7 +430,7 @@ def test_task_store_scope_change_revokes_grants_and_pending_requests(home: Path)
     other_pending = center.request("comment", "o/r#2", "once", "other-task")
 
     before = store.get(task.id).scope_version
-    store.update_scope(task.id, cadence_seconds=600)
+    store.update_scope(task.id, purpose="scope edit probe")
     after = store.get(task.id).scope_version
     assert after == before + 1
     assert not center.permits("rerun", "owner/repo#1", "failed-checks")

@@ -368,8 +368,10 @@ class TaskStore:
                 raise TaskError("task is no longer active; use an explicit lifecycle operation")
             if task.scope_version < current.scope_version:
                 raise TaskError("task scope changed; reload it before updating")
+            # Cadence is an operational knob (#95): adjusting it must not
+            # invalidate grants, so it is not an authorization-scope field.
             scope_fields = (
-                "target", "purpose", "cadence_seconds", "allowed_actions",
+                "target", "purpose", "allowed_actions",
                 "notification_conditions", "stop_conditions",
             )
             scope_changed = any(
@@ -481,12 +483,49 @@ class TaskStore:
             stop_conditions=(
                 stop_conditions if stop_conditions is not None else task.stop_conditions
             ),
-            cadence_seconds=(
-                cadence_seconds if cadence_seconds is not None else task.cadence_seconds
-            ),
         )
         changed.scope_version = task.scope_version + 1
         return self.update(changed)
+
+    def update_tuning(
+        self,
+        task_id: str,
+        *,
+        cadence_seconds: int | None = None,
+        digest_interval_seconds: int | None | str | None = None,
+        stale_after_seconds: int | None | str | None = None,
+        flaky_alerts: bool | None = None,
+    ) -> Task:
+        """Operational knobs, not authorization scope: cadence and the
+        watch-kind dimensions adjust in place with NO scope_version bump,
+        so grants survive (#95). A string value of "off" clears a dimension
+        (None means "leave unchanged"); terminal watches reject.
+        """
+        task = self._require(task_id)
+        if task.state.terminal:
+            raise TaskError("task is no longer active; use an explicit lifecycle operation")
+
+        def tuned(current, value):
+            if value is None:
+                return current
+            return None if isinstance(value, str) else value
+
+        changed = replace(
+            task,
+            cadence_seconds=(
+                cadence_seconds if cadence_seconds is not None else task.cadence_seconds
+            ),
+            digest_interval_seconds=tuned(
+                task.digest_interval_seconds, digest_interval_seconds
+            ),
+            stale_after_seconds=tuned(
+                task.stale_after_seconds, stale_after_seconds
+            ),
+            flaky_alerts=(
+                flaky_alerts if flaky_alerts is not None else task.flaky_alerts
+            ),
+        )
+        return self.update(changed)  # validate() enforces the enums
 
     def _require(self, task_id: str) -> Task:
         task = self.get(task_id)
