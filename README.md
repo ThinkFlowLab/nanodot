@@ -273,6 +273,17 @@ processes. This is a test tripwire, not an OS firewall sandbox for arbitrary
 subprocesses. CI applies offline proxy settings to the test step only, after
 checkout, Python setup, and dependency installation.
 
+## Parallel work: claim before you start
+
+This repository is developed by multiple concurrent agent sessions, and a
+green CI run proves a PR's code — not that two PRs agree with each other.
+Before starting work on an issue, comment a claim on it
+(`claiming — starting now`), and check open PRs and recent claims first.
+If a claim has gone stale (no activity for a few hours), it is free again.
+When a collision is discovered late, the later PR closes as a duplicate
+with a diff of anything unique it found — see #71 and #89 for the pattern.
+CI cannot catch semantic conflicts; the claim protocol is the defense.
+
 ## Documentation
 
 - [Installation](docs/installation.md): prerequisites, source setup, updates,
