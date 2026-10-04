@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import argparse
 import getpass
+import logging
 import os
 import signal
 import subprocess
@@ -912,6 +913,7 @@ def _run_runner(args: argparse.Namespace) -> int:
                         return 0
                     signal.signal(signal.SIGINT, _sigint)
                     signal.signal(signal.SIGTERM, _sigint)
+                    _configure_runner_logging()
                     print("nanodot runner started — Ctrl-C to stop", flush=True)
                     daemon.serve(stop)
                     print("nanodot runner stopped")
@@ -979,6 +981,20 @@ def _run_start(_: argparse.Namespace) -> int:
     except (RunnerControlError, OSError) as error:
         print(f"error: {error}", file=sys.stderr)
         return 1
+
+
+_RUNNER_LOG_FORMAT = "%(asctime)s %(levelname)s %(name)s %(message)s"
+
+
+def _configure_runner_logging() -> None:
+    """Timestamped WARNING+ logging for the runner process. runner.log
+    lines are the only forensic trail after a crash; without timestamps a
+    failure storm (e.g. a transient DB lock) cannot be placed in time.
+    Process-local: this is our own process, not a global library policy."""
+    logging.basicConfig(
+        level=logging.WARNING,
+        format=_RUNNER_LOG_FORMAT,
+    )
 
 
 def _runner_alive() -> bool:

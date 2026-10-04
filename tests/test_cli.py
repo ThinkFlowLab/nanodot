@@ -391,3 +391,20 @@ def test_watch_add_flaky_persists_and_shows(
 
     assert main(["watch", "show", task.id]) == 0
     assert "flaky alerts:" in capsys.readouterr().out
+
+
+def test_runner_logging_is_timestamped() -> None:
+    """runner.log is the post-crash forensic trail; every line must carry
+    a timestamp (found missing while diagnosing the dogfood failure storm)."""
+    import logging
+    import re
+
+    from nanodot.cli import _RUNNER_LOG_FORMAT
+
+    rendered = logging.Formatter(_RUNNER_LOG_FORMAT).format(
+        logging.LogRecord(
+            "nanodot.native.daemon", logging.WARNING, __file__, 1,
+            "task listing failed; will retry next pass", None, None,
+        )
+    )
+    assert re.match(r"^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2},\d{3} ", rendered), rendered
