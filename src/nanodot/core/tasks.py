@@ -51,6 +51,19 @@ SUPPORTED_STOP_CONDITIONS = frozenset(
 SUPPORTED_DIGEST_INTERVALS = frozenset({21600, 43200, 86400})  # 6h/12h/24h
 # Stale thresholds (issue #84): days a head may sit unchanged before the
 # once-per-commit alert; a fixed enum.
+def _decode_watch_state(raw: str | None) -> dict:
+    """Contain corruption at the decode boundary: valid JSON of the wrong
+    type (an int, string, or list — seen live on the dogfood) loads as an
+    empty dict instead of bricking every consumer of the row."""
+    if raw is None:
+        return {}
+    try:
+        decoded = json.loads(raw)
+    except (TypeError, ValueError):
+        return {}
+    return decoded if isinstance(decoded, dict) else {}
+
+
 SUPPORTED_STALE_AFTER = frozenset({172800, 259200, 604800, 1209600})  # 2d..14d
 
 # Flaky conclusions (issue #84/#86): the two definitive families. Anything
@@ -257,7 +270,7 @@ class TaskStore:
             digest_interval_seconds=row["digest_interval_seconds"],
             stale_after_seconds=row["stale_after_seconds"],
             flaky_alerts=bool(row["flaky_alerts"]),
-            watch_state=json.loads(row["watch_state"]),
+            watch_state=_decode_watch_state(row["watch_state"]),
         )
 
     def _task_to_values(self, task: Task) -> tuple:
@@ -330,11 +343,16 @@ class TaskStore:
             ).fetchall()
         tasks = []
         for row in rows:
-            task = self._row_to_task(row)
             try:
+                task = self._row_to_task(row)
                 self.validate(task)
-            except TaskError as error:
-                self.set_blocked(task.id, f"invalid saved task scope: {error}")
+            except (TaskError, ValueError, TypeError, KeyError) as error:
+                # One corrupt row costs one task, never the pass: quarantine
+                # it, and if even the quarantine write fails, skip the row.
+                try:
+                    self.set_blocked(row["id"], f"invalid saved task scope: {error}")
+                except Exception:
+                    pass
                 continue
             tasks.append(task)
         return tasks
