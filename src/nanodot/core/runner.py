@@ -459,25 +459,36 @@ class TaskLoop:
         """One notification per same-SHA conclusion flip: intra-snapshot
         (a poll holding both a red and a green run for one name) or
         cross-poll (the tracked per-name conclusion flipped). Non-definitive
-        states never participate; a new head SHA resets the map."""
+        states never participate; a new head SHA resets the map. A flip is
+        keyed to its evidence, not to the poll: an unchanged snapshot never
+        re-fires (#93)."""
         from nanodot.core.tasks import GREEN_CONCLUSIONS, RED_CONCLUSIONS
 
         state = task.watch_state
         tracked = dict(state.get("flaky_seen") or {})
         flips = state.get("flaky_flips") or {}
+        intra_fired = set(state.get("flaky_intra_fired") or [])
         if state.get("flaky_sha") != snapshot.head_sha:
-            tracked, flips = {}, {}
+            tracked, flips, intra_fired = {}, {}, set()
         events = []
         per_name: dict[str, set[str]] = {}
+        latest: dict[str, str] = {}
         for run in snapshot.checks_for(snapshot.head_sha):
             if run.conclusion in RED_CONCLUSIONS:
                 per_name.setdefault(run.name, set()).add("red")
+                latest[run.name] = "red"
             elif run.conclusion in GREEN_CONCLUSIONS:
                 per_name.setdefault(run.name, set()).add("green")
+                latest[run.name] = "green"
         for name, families in sorted(per_name.items()):
             red, green = "red" in families, "green" in families
             if red and green:
+                # One orderless fact per commit: GitHub retains both runs,
+                # so the pair persists across polls — emit it exactly once.
+                if name in intra_fired:
+                    continue
                 direction = "red+green"
+                intra_fired.add(name)
             elif tracked.get(name) == "green" and red:
                 direction = "green->red"
             elif tracked.get(name) == "red" and green:
@@ -503,13 +514,13 @@ class TaskLoop:
                 at=now,
                 occurrence=f"flaky-{snapshot.head_sha[:10]}-{name}-{sequence}",
             ))
-        # Track the latest definitive conclusion per name for cross-poll.
-        for name, families in per_name.items():
-            if len(families) == 1:
-                tracked[name] = next(iter(families))
+        # Track the latest definitive conclusion per name in run order —
+        # even on multi-family polls, so a later collapse to a single
+        # opposite family (genuinely new evidence) still fires cross-poll.
+        tracked.update(latest)
         task.watch_state = dict(
             state, flaky_sha=snapshot.head_sha, flaky_seen=tracked,
-            flaky_flips=flips,
+            flaky_flips=flips, flaky_intra_fired=sorted(intra_fired),
         )
         for event in events:
             self._record_event(event)
