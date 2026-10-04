@@ -105,9 +105,11 @@ def test_scope_stored_verbatim_and_version_bumps(home: Path) -> None:
     assert loaded.stop_conditions == DEFAULT_STOP_CONDITIONS
     assert loaded.scope_version == 1
 
-    changed = store.update_scope(task.id, cadence_seconds=600)
+    changed = store.update_tuning(task.id, cadence_seconds=600)
     assert changed.cadence_seconds == 600
-    assert changed.scope_version == 2
+    assert changed.scope_version == 1  # operational knob: no version bump
+    rescoped = store.update_scope(task.id, purpose="narrowed")
+    assert rescoped.scope_version == 2  # a real scope change still bumps
 
 
 def test_blocked_state_carries_reason(home: Path) -> None:

@@ -72,6 +72,17 @@ def build_parser() -> argparse.ArgumentParser:
     for action in ("pause", "resume", "cancel"):
         cmd = watch_sub.add_parser(action, help=f"{action} a task")
         cmd.add_argument("task_id")
+    update = watch_sub.add_parser(
+        "update", help="adjust operational knobs in place (grants survive)"
+    )
+    update.add_argument("task_id")
+    update.add_argument("--cadence", type=int, help="seconds between checks")
+    update.add_argument("--digest", choices=["off", "6h", "12h", "24h"],
+                        help="scheduled heartbeat interval")
+    update.add_argument("--stale", choices=["off", "2d", "3d", "7d", "14d"],
+                        help="idle alert threshold")
+    update.add_argument("--flaky", choices=["on", "off"],
+                        help="pass/fail flip alerts")
     add.add_argument(
         "--digest", default="off",
         choices=["off", "6h", "12h", "24h"],
@@ -483,6 +494,50 @@ def _run_watch(args: argparse.Namespace) -> int:
                 return 1
         created = store.create(task)
         print(f"created watch {created.id} ({created.target})")
+        return 0
+
+    if args.watch_command == "update":
+        knobs = {
+            "cadence": args.cadence,
+            "digest": args.digest,
+            "stale": args.stale,
+            "flaky": args.flaky,
+        }
+        if all(value is None for value in knobs.values()):
+            print("error: nothing to update — pass at least one of "
+                  "--cadence/--digest/--stale/--flaky", file=sys.stderr)
+            return 1
+        task = store.get(args.task_id)
+        if task is None:
+            print(f"error: no such task {args.task_id}", file=sys.stderr)
+            return 1
+        digest_map = {"off": "off", "6h": 21600, "12h": 43200, "24h": 86400}
+        stale_map = {"off": "off", "2d": 172800, "3d": 259200,
+                     "7d": 604800, "14d": 1209600}
+        try:
+            updated = store.update_tuning(
+                args.task_id,
+                cadence_seconds=args.cadence,
+                digest_interval_seconds=(
+                    None if args.digest is None else digest_map[args.digest]
+                ),
+                stale_after_seconds=(
+                    None if args.stale is None else stale_map[args.stale]
+                ),
+                flaky_alerts=(
+                    None if args.flaky is None else args.flaky == "on"
+                ),
+            )
+        except TaskError as error:
+            print(f"error: {error}", file=sys.stderr)
+            return 1
+        def _show(value, unit, off="off"):
+            return off if value is None else f"{value}{unit}"
+        print(f"updated {updated.id} ({updated.target}) — grants unaffected")
+        print(f"  cadence: {updated.cadence_seconds}s  "
+              f"digest: {_show(updated.digest_interval_seconds and updated.digest_interval_seconds // 3600, 'h')}  "
+              f"stale: {_show(updated.stale_after_seconds and updated.stale_after_seconds // 86400, 'd')}  "
+              f"flaky: {'on' if updated.flaky_alerts else 'off'}")
         return 0
 
     if args.watch_command in ("pause", "resume", "cancel"):

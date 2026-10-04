@@ -248,7 +248,7 @@ def test_lifecycle_change_during_fetch_prevents_delivery_and_stale_write(home, c
     class ChangingFetcher:
         def fetch(self, target):
             if change == "scope":
-                h.store.update_scope(h.task.id, cadence_seconds=600)
+                h.store.update_scope(h.task.id, purpose="scope edit probe")
             else:
                 getattr(h.store, change)(h.task.id)
             if fetch_error:
@@ -265,7 +265,7 @@ def test_lifecycle_change_during_fetch_prevents_delivery_and_stale_write(home, c
     assert h.sink.events == []
     saved = h.store.get(h.task.id)
     if change == "scope":
-        assert saved.cadence_seconds == 600 and saved.scope_version == 2
+        assert saved.purpose == "scope edit probe" and saved.scope_version == 2
     else:
         assert saved.state is (TaskState.PAUSED if change == "pause" else TaskState.CANCELLED)
 
@@ -316,7 +316,7 @@ def test_lifecycle_change_during_summary_prevents_notification_and_write(home, c
     class ChangingProvider:
         def summarize(self, change_event):
             if change == "scope":
-                h.store.update_scope(h.task.id, cadence_seconds=600)
+                h.store.update_scope(h.task.id, purpose="scope edit probe")
             else:
                 getattr(h.store, change)(h.task.id)
             return "finished"
@@ -346,10 +346,10 @@ def test_stale_update_cannot_undo_pause_or_scope_change(home):
         store.update(task)
     assert store.get(task.id).state is TaskState.PAUSED
     store.resume(task.id, now=1000)
-    store.update_scope(task.id, cadence_seconds=600)
+    store.update_scope(task.id, purpose="scope edit probe")
     with pytest.raises(TaskError, match="scope changed"):
         store.update(task)
-    assert store.get(task.id).cadence_seconds == 600
+    assert store.get(task.id).purpose == "scope edit probe"
 
 
 def test_secret_target_is_rejected_on_create_update_and_execution(home):

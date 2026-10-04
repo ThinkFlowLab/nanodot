@@ -372,7 +372,7 @@ def test_lifecycle_change_kills_the_capability(home: Path, change: str) -> None:
     h.tick()
     h.approve_proposal()
     if change == "scope":
-        h.store.update_scope(h.task.id, cadence_seconds=600)
+        h.store.update_scope(h.task.id, purpose="scope edit probe")
     elif change == "pause":
         h.store.pause(h.task.id)
     else:
