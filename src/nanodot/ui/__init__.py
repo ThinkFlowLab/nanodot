@@ -6,4 +6,6 @@ mutation or read beyond the shell rides a CLI subprocess (the DSH-tools
 pattern). The runner's lifetime flock stays the only write path's owner.
 """
 
-from nanodot.ui.server import UIServer, serve  # noqa: F401  (public surface)
+from nanodot.ui.server import (  # noqa: F401  (public surface)
+    LOOPBACK, NanodotUI, UIHandler, UIServer, handler_exchange, serve,
+)
