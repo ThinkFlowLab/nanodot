@@ -273,6 +273,22 @@ processes. This is a test tripwire, not an OS firewall sandbox for arbitrary
 subprocesses. CI applies offline proxy settings to the test step only, after
 checkout, Python setup, and dependency installation.
 
+## The loopback UI
+
+```sh
+nanodot ui
+```
+
+A single-page interface served on `127.0.0.1` only (a random token is
+generated per boot; the address is printed and opened in the browser).
+Tasks, inbox, activity, memory, and approvals render CLI output; the
+runner can be started and stopped from the page. The UI is an
+unprivileged consumer like any other: every mutation spawns the CLI in a
+child process — there is no second writer and no new egress. See
+[RFC #100](https://github.com/ThinkFlowLab/nanodot/issues/100) for the
+design and the roadmap (approvals surface, first-run wizard, desktop
+shell).
+
 ## Parallel work: claim before you start
 
 This repository is developed by multiple concurrent agent sessions, and a
