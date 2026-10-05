@@ -143,6 +143,11 @@ def build_parser() -> argparse.ArgumentParser:
     a_grant.add_argument("--no-expiry", action="store_true")
 
     # -- activity / inbox --------------------------------------------------
+    ui = subparsers.add_parser(
+        "ui", help="open the loopback UI (Tasks/Inbox/Activity/Memory/Approvals)"
+    )
+    ui.add_argument("--port", type=int, default=0, help="port (0 = pick a free one)")
+    ui.add_argument("--no-open", action="store_true", help="do not open a browser")
     activity = subparsers.add_parser("activity", help="what actually ran")
     activity.add_argument("task_id", nargs="?")
     activity.add_argument("--all", action="store_true",
@@ -997,6 +1002,14 @@ def _configure_runner_logging() -> None:
     )
 
 
+def _run_ui(args: argparse.Namespace) -> int:
+    from nanodot.ui.server import serve
+
+    url = serve(port=args.port, open_browser=not args.no_open)
+    print(f"nanodot ui was at {url} (stopped)")
+    return 0
+
+
 def _runner_alive() -> bool:
     from nanodot.native.runner_control import running_pid
 
@@ -1048,6 +1061,8 @@ def main(argv: list[str] | None = None) -> int:
             return _run_model_usage(args)
     if args.command == "approvals":
         return _run_approvals(args)
+    if args.command == "ui":
+        return _run_ui(args)
     if args.command == "activity":
         return _run_activity(args)
     if args.command == "inbox":
