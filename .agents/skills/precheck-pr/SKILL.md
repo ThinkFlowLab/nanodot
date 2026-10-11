@@ -19,6 +19,13 @@ This is a contributor preparation step, not a prerequisite for an independent
 read-only review of someone else's PR, and it does not change automated review
 selection or authorize any external action.
 
+Before submission, verify that the [PR template](../../../.github/pull_request_template.md)'s
+four required human answers and PR-necessity decision are complete and traceable,
+and that bug-fix failure evidence is present when applicable. Blank fields,
+placeholders, and agent-invented answers block implementation/submission. This is
+a contributor workflow constraint; the Markdown template itself is not server-side
+enforcement. Independent read-only reviews remain outside this gate.
+
 Use explicit human answers already present in the task, issue, or discussion,
 keeping a traceable reference to their source. Ask only for missing or ambiguous
 answers, then wait for the human; do not infer, invent, or answer on their behalf:
